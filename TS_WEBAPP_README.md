@@ -7,10 +7,10 @@ intermediate from its reagent sets, each later step reacts that intermediate wit
 more reagent set), and **only the final product is docked and scored**.
 
 Every enumerated final product is **filtered for PAINS and REOS** (reusing the
-[`ligprepper`](../ligprepper) SMARTS sets) and, optionally, **MW / logP ranges** *before*
-docking — these are **hard filters**: a failing molecule is rejected without docking and
-never counted. Ligand preparation (OpenBabel protonation at a target pH + RDKit ETKDGv3
-embed / MMFF94s minimize) is the same pipeline used by the [GNINA web app](../gnina).
+`ligprepper` SMARTS sets) and, optionally, **MW / logP ranges** *before* docking — these
+are **hard filters**: a failing molecule is rejected without docking and never counted.
+Ligand preparation (OpenBabel protonation at a target pH + RDKit ETKDGv3 embed / MMFF94s
+minimize) is the same pipeline used by the companion GNINA docking web app.
 
 It lets you screen large, un-enumerated combinatorial libraries against a protein target
 without enumerating or docking the whole space — TS samples the reagents that matter.
@@ -309,3 +309,13 @@ must equal the number of reagent files. A single step reproduces the original
   working directory are shared.
 - Per-job working dirs and downloads live under `jobs/<id>/` (gitignored, not auto-pruned).
 - The search loop tolerates library exhaustion on tiny libraries (reports partial results).
+
+---
+
+## Credits
+
+Built on the **Thompson Sampling** implementation by Patrick Walters
+([PatWalters/TS](https://github.com/PatWalters/TS), MIT) — see `README.md` and the paper
+*"Thompson Sampling — An Efficient Method for Searching Ultralarge Synthesis-on-Demand
+Databases"* (J. Chem. Inf. Model. 2024). The web app, GNINA evaluator, multi-step route
+sampler, and pre-dock filtering were added on top. Licensed under MIT (`LICENSE`).
