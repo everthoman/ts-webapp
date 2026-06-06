@@ -1,0 +1,47 @@
+{
+  "reagent_sets": {
+    "primary_amines_100":   {"file": "data/primary_amines_100.smi",   "count": 100,   "label": "Primary amines (100)"},
+    "primary_amines_500":   {"file": "data/primary_amines_500.smi",   "count": 500,   "label": "Primary amines (500)"},
+    "primary_amines_ok":    {"file": "data/primary_amines_ok.smi",    "count": 13842, "label": "Primary amines (full, 13842)"},
+    "carboxylic_acids_100": {"file": "data/carboxylic_acids_100.smi", "count": 100,   "label": "Carboxylic acids (100)"},
+    "carboxylic_acids_500": {"file": "data/carboxylic_acids_500.smi", "count": 500,   "label": "Carboxylic acids (500)"},
+    "carboxylic_acids_ok":  {"file": "data/carboxylic_acids_ok.smi",  "count": 4214,  "label": "Carboxylic acids (full, 4214)"},
+    "aminobenzoic_100":     {"file": "data/aminobenzoic_100.smi",     "count": 100,   "label": "Aminobenzoic acids (100)"},
+    "aminobenzoic_ok":      {"file": "data/aminobenzoic_ok.smi",      "count": 376,   "label": "Aminobenzoic acids (full, 376)"}
+  },
+  "reactions": [
+    {
+      "id": "amide",
+      "name": "Amide coupling (amine + acid)",
+      "role": "start",
+      "takes_intermediate": false,
+      "smarts": "[NH2:2][#6:1].[#6:4][C:3]([OH])=O>>[NH:2]([#6:1])[C:3]([#6:4])=O",
+      "components": [
+        {"label": "Primary amine",    "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]},
+        {"label": "Carboxylic acid",  "sets": ["carboxylic_acids_100", "carboxylic_acids_500", "carboxylic_acids_ok"]}
+      ]
+    },
+    {
+      "id": "quinazolinone",
+      "name": "Quinazolinone (aminobenzoic acid + amine + acid)",
+      "role": "start",
+      "takes_intermediate": false,
+      "smarts": "N[c:4][c:3]C(O)=O.[#6:1][NH2].[#6:2]C(=O)[OH]>>[C:2]c1n[c:4][c:3]c(=O)n1[C:1]",
+      "components": [
+        {"label": "Aminobenzoic acid", "sets": ["aminobenzoic_100", "aminobenzoic_ok"]},
+        {"label": "Primary amine",     "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]},
+        {"label": "Carboxylic acid",   "sets": ["carboxylic_acids_100", "carboxylic_acids_500", "carboxylic_acids_ok"]}
+      ]
+    },
+    {
+      "id": "n_acylation",
+      "name": "N-acylation of a free amine (extension step)",
+      "role": "extend",
+      "takes_intermediate": true,
+      "smarts": "[NX3;H1,H2:2].[#6:4][C:3]([OH])=O>>[N:2][C:3]([#6:4])=O",
+      "components": [
+        {"label": "Carboxylic acid",   "sets": ["carboxylic_acids_100", "carboxylic_acids_500", "carboxylic_acids_ok"]}
+      ]
+    }
+  ]
+}

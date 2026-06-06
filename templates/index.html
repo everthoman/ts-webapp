@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thompson Sampling + GNINA Docking</title>
+<style>
+  :root { --bg:#0f1420; --panel:#1a2132; --accent:#4f9cff; --ok:#39c46e; --warn:#ffb347; --err:#ff5d5d; --text:#e6ecf5; --muted:#8b97ad; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:18px 26px; border-bottom:1px solid #2a3550; background:linear-gradient(90deg,#162038,#0f1420); }
+  header h1 { margin:0; font-size:20px; }
+  header p { margin:4px 0 0; color:var(--muted); font-size:13px; }
+  .wrap { display:grid; grid-template-columns: 1.15fr 1fr; gap:18px; padding:18px 26px; }
+  @media (max-width: 1000px){ .wrap{ grid-template-columns:1fr; } }
+  .panel { background:var(--panel); border:1px solid #2a3550; border-radius:10px; padding:16px 18px; margin-bottom:16px; }
+  .panel h2 { margin:0 0 12px; font-size:15px; color:var(--accent); letter-spacing:.3px; }
+  label { display:block; font-size:13px; margin:10px 0 4px; color:var(--muted); }
+  input[type=text], input[type=number], select { width:100%; padding:8px 10px; background:#0d121d; border:1px solid #2f3a57; border-radius:7px; color:var(--text); font-size:13px; }
+  .row { display:flex; gap:10px; } .row > * { flex:1; }
+  .grid3 { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+  .grid2 { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; }
+  button { cursor:pointer; border:none; border-radius:7px; padding:9px 14px; font-size:13px; font-weight:600; }
+  .btn { background:var(--accent); color:#fff; } .btn:hover{ filter:brightness(1.1); }
+  .btn.ghost { background:#28324c; color:var(--text); }
+  .btn.danger { background:var(--err); color:#fff; }
+  .btn:disabled { opacity:.45; cursor:not-allowed; }
+  .step { border:1px solid #2f3a57; border-radius:8px; padding:12px; margin-bottom:10px; background:#131a29; }
+  .step .head { display:flex; justify-content:space-between; align-items:center; }
+  .step .head b { color:var(--accent); font-size:12px; }
+  .chip { font-size:11px; color:var(--muted); }
+  .checkline { display:flex; align-items:center; gap:8px; margin:8px 0; }
+  .checkline input { width:auto; }
+  #log { background:#070a11; border:1px solid #2a3550; border-radius:8px; padding:12px; height:430px; overflow:auto; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size:12px; line-height:1.5; white-space:pre-wrap; }
+  .muted { color:var(--muted); font-size:12px; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:999px; font-size:11px; font-weight:600; }
+  .status-queued{ background:#2a3550; } .status-running{ background:#234a7a; } .status-done{ background:#1d5e38; } .status-error{ background:#5e1d1d; } .status-cancelled{ background:#5e4a1d; }
+  .note { font-size:12px; color:var(--warn); margin-top:8px; }
+  a.dl { color:var(--accent); font-size:13px; margin-right:16px; }
+  .bad { color:var(--err); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Thompson Sampling &times; GNINA docking</h1>
+  <p>Search un-enumerated reaction libraries with Thompson Sampling, scoring final products by GNINA docking.
+     Products are filtered for PAINS / REOS and optional MW / logP before docking.</p>
+</header>
+
+<div class="wrap">
+  <!-- LEFT: configuration -->
+  <div>
+    <div class="panel">
+      <h2>1 &middot; Reaction route</h2>
+      <div class="muted">Step 1 is a starting reaction; further steps react the running intermediate with one more reagent set. Only the final product is docked.</div>
+      <div id="steps"></div>
+      <div class="row" style="margin-top:8px">
+        <button class="btn ghost" id="addStep" type="button">+ Add extension step</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>2 &middot; Receptor &amp; binding site</h2>
+      <label>Receptor (prepared PDB)</label>
+      <input type="file" id="receptor" accept=".pdb">
+      <label style="margin-top:12px">Binding site</label>
+      <select id="bsMode">
+        <option value="reference">Reference ligand (autobox)</option>
+        <option value="coords">XYZ coordinates + box</option>
+      </select>
+      <div id="bsReference">
+        <label>Reference ligand (SDF)</label>
+        <input type="file" id="reference" accept=".sdf">
+        <label>Autobox padding (&Aring;)</label>
+        <input type="number" id="autoboxAdd" value="4" step="0.5">
+      </div>
+      <div id="bsCoords" style="display:none">
+        <div class="grid3">
+          <div><label>Center X</label><input type="number" id="cx" step="0.1" value="0"></div>
+          <div><label>Center Y</label><input type="number" id="cy" step="0.1" value="0"></div>
+          <div><label>Center Z</label><input type="number" id="cz" step="0.1" value="0"></div>
+        </div>
+        <label>Box edge (&Aring;)</label>
+        <input type="number" id="boxSize" value="16" step="1">
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>3 &middot; GNINA docking</h2>
+      <div class="grid2">
+        <div>
+          <label>Score field (objective)</label>
+          <select id="scoreField">
+            <option value="minimizedAffinity" selected>minimizedAffinity (minimize)</option>
+            <option value="CNNaffinity">CNNaffinity (maximize)</option>
+            <option value="CNN_VS">CNN_VS (maximize)</option>
+          </select>
+        </div>
+        <div>
+          <label>CNN scoring</label>
+          <select id="cnnScoring">
+            <option value="rescore" selected>rescore</option>
+            <option value="none">none (Vina only, fastest)</option>
+            <option value="all">all</option>
+          </select>
+        </div>
+      </div>
+      <div class="grid3" style="margin-top:6px">
+        <div><label>Exhaustiveness</label><input type="number" id="exh" value="8" min="1" max="64"></div>
+        <div><label>Poses / ligand</label><input type="number" id="numModes" value="9" min="1"></div>
+        <div><label>LigPrep pH</label><input type="number" id="ph" value="7.4" step="0.1"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>4 &middot; Filters (applied before docking)</h2>
+      <div class="checkline"><input type="checkbox" id="pains" checked><label style="margin:0">PAINS structural alerts</label></div>
+      <div class="checkline"><input type="checkbox" id="reos" checked><label style="margin:0">REOS functional-group filter</label></div>
+      <div class="grid2">
+        <div class="row"><div><label>MW min</label><input type="number" id="mwLo" placeholder="e.g. 150"></div>
+             <div><label>MW max</label><input type="number" id="mwHi" placeholder="e.g. 500"></div></div>
+        <div class="row"><div><label>logP min</label><input type="number" id="logpLo" step="0.1" placeholder="-2"></div>
+             <div><label>logP max</label><input type="number" id="logpHi" step="0.1" placeholder="5"></div></div>
+      </div>
+      <div class="muted" style="margin-top:6px">Leave a property blank to disable it. Out-of-range / alert-matching molecules are rejected without docking.</div>
+    </div>
+
+    <div class="panel">
+      <h2>5 &middot; Thompson Sampling</h2>
+      <div class="grid3">
+        <div><label>Warm-up trials / reagent</label><input type="number" id="warmup" value="2" min="1"></div>
+        <div><label>Search iterations</label><input type="number" id="iters" value="100" min="1"></div>
+        <div><label>GPU id</label><input type="number" id="gpu" value="0" min="0"></div>
+      </div>
+      <div class="note" id="costNote"></div>
+    </div>
+
+    <div class="panel">
+      <div class="row">
+        <button class="btn" id="runBtn" type="button">Run search</button>
+        <button class="btn danger" id="cancelBtn" type="button" disabled>Cancel</button>
+      </div>
+      <div id="gninaWarn" class="note" style="display:none">⚠ GNINA binary not found at the configured path — docking will fail. Set GNINA_PATH.</div>
+    </div>
+  </div>
+
+  <!-- RIGHT: progress -->
+  <div>
+    <div class="panel">
+      <h2>Run status <span id="statusPill" class="pill status-queued" style="display:none"></span></h2>
+      <div id="downloads" class="muted">No results yet.</div>
+      <div id="log" style="margin-top:10px"><span class="muted">Logs will stream here…</span></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const CATALOG = __CATALOG_JSON__;
+const GNINA_OK = __GNINA_OK__;
+const startReactions  = CATALOG.reactions.filter(r => r.role === 'start');
+const extendReactions = CATALOG.reactions.filter(r => r.role === 'extend');
+
+function setOptions(sel, ids, sets){
+  sel.innerHTML = ids.map(id => `<option value="${id}">${sets[id].label}</option>`).join('');
+}
+
+function reagentRowsFor(reaction, stepIdx){
+  // one <select> per component
+  return reaction.components.map((c, ci) => `
+    <label style="margin-top:8px">${c.label}</label>
+    <select data-step="${stepIdx}" class="reagentSel">
+      ${c.sets.map(s => `<option value="${s}">${CATALOG.reagent_sets[s].label}</option>`).join('')}
+    </select>`).join('');
+}
+
+function makeStep(idx){
+  const isFirst = idx === 0;
+  const reactions = isFirst ? startReactions : extendReactions;
+  const div = document.createElement('div');
+  div.className = 'step';
+  div.dataset.step = idx;
+  div.innerHTML = `
+    <div class="head">
+      <b>Step ${idx+1} ${isFirst ? '· start' : '· extend (intermediate + reagent)'}</b>
+      ${isFirst ? '' : '<button class="btn ghost removeStep" type="button" style="padding:4px 10px">remove</button>'}
+    </div>
+    <label>Reaction</label>
+    <select class="reactionSel">
+      ${reactions.map(r => `<option value="${r.id}">${r.name}</option>`).join('')}
+    </select>
+    <div class="reagents"></div>`;
+  const rxnSel = div.querySelector('.reactionSel');
+  const reagentsDiv = div.querySelector('.reagents');
+  function refresh(){
+    const r = CATALOG.reactions.find(x => x.id === rxnSel.value);
+    reagentsDiv.innerHTML = reagentRowsFor(r, idx);
+    updateCost();
+  }
+  rxnSel.addEventListener('change', refresh);
+  refresh();
+  const rm = div.querySelector('.removeStep');
+  if (rm) rm.addEventListener('click', () => { div.remove(); renumber(); updateCost(); });
+  return div;
+}
+
+function renumber(){
+  [...document.querySelectorAll('#steps .step')].forEach((s,i)=>{
+    s.dataset.step = i;
+    s.querySelector('.head b').innerHTML = `Step ${i+1} ${i===0?'· start':'· extend (intermediate + reagent)'}`;
+    s.querySelectorAll('.reagentSel').forEach(sel=>sel.dataset.step=i);
+  });
+}
+
+const stepsDiv = document.getElementById('steps');
+stepsDiv.appendChild(makeStep(0));
+document.getElementById('addStep').addEventListener('click', ()=>{
+  if (!extendReactions.length){ alert('No extension reactions defined in reactions.json'); return; }
+  stepsDiv.appendChild(makeStep(document.querySelectorAll('#steps .step').length));
+});
+
+document.getElementById('bsMode').addEventListener('change', e=>{
+  const ref = e.target.value === 'reference';
+  document.getElementById('bsReference').style.display = ref ? '' : 'none';
+  document.getElementById('bsCoords').style.display = ref ? 'none' : '';
+});
+
+function collectSteps(){
+  return [...document.querySelectorAll('#steps .step')].map(s => ({
+    reaction_id: s.querySelector('.reactionSel').value,
+    reagent_sets: [...s.querySelectorAll('.reagentSel')].map(sel => sel.value),
+  }));
+}
+
+function reagentCount(){
+  let total = 0;
+  collectSteps().forEach(s => s.reagent_sets.forEach(id => total += CATALOG.reagent_sets[id].count));
+  return total;
+}
+function updateCost(){
+  const warm = parseInt(document.getElementById('warmup').value||'0');
+  const iters = parseInt(document.getElementById('iters').value||'0');
+  const est = reagentCount()*warm + iters;
+  document.getElementById('costNote').textContent =
+    `≈ up to ${est.toLocaleString()} docking calls (warm-up ${reagentCount()}×${warm} + ${iters} iterations). ` +
+    `Repeated products are cached. Start small — docking dominates runtime.`;
+}
+['warmup','iters'].forEach(id=>document.getElementById(id).addEventListener('input', updateCost));
+updateCost();
+if (!GNINA_OK) document.getElementById('gninaWarn').style.display='block';
+
+function buildConfig(){
+  const bsMode = document.getElementById('bsMode').value;
+  const binding = bsMode === 'reference'
+    ? { mode:'reference' }
+    : { mode:'coords',
+        center:[parseFloat(cx.value),parseFloat(cy.value),parseFloat(cz.value)],
+        box_size:parseFloat(boxSize.value) };
+  const numOrNull = el => el.value==='' ? null : parseFloat(el.value);
+  return {
+    steps: collectSteps(),
+    binding_site: binding,
+    gnina: {
+      score_field: scoreField.value,
+      cnn_scoring: cnnScoring.value,
+      exhaustiveness: parseInt(exh.value),
+      num_modes: parseInt(numModes.value),
+      autobox_add: parseFloat(autoboxAdd.value),
+      ph: parseFloat(ph.value),
+    },
+    filters: {
+      pains: pains.checked, reos: reos.checked,
+      mw: [numOrNull(mwLo), numOrNull(mwHi)],
+      logp: [numOrNull(logpLo), numOrNull(logpHi)],
+    },
+    ts: { num_warmup_trials: parseInt(warmup.value), num_ts_iterations: parseInt(iters.value) },
+    gpu_id: parseInt(gpu.value),
+  };
+}
+
+let currentJob = null;
+const logEl = document.getElementById('log');
+const pill = document.getElementById('statusPill');
+function setStatus(s){ pill.style.display='inline-block'; pill.className='pill status-'+s; pill.textContent=s; }
+function addLog(line, bad){ const d=document.createElement('div'); if(bad)d.className='bad'; d.textContent=line; logEl.appendChild(d); logEl.scrollTop=logEl.scrollHeight; }
+
+document.getElementById('runBtn').addEventListener('click', async ()=>{
+  const recEl = document.getElementById('receptor');
+  if (!recEl.files.length){ alert('Please upload a receptor PDB.'); return; }
+  const bsMode = document.getElementById('bsMode').value;
+  const refEl = document.getElementById('reference');
+  if (bsMode==='reference' && !refEl.files.length){ alert('Upload a reference ligand SDF (autobox mode).'); return; }
+
+  const fd = new FormData();
+  fd.append('config', JSON.stringify(buildConfig()));
+  fd.append('receptor', recEl.files[0]);
+  if (bsMode==='reference') fd.append('reference', refEl.files[0]);
+
+  logEl.innerHTML=''; document.getElementById('downloads').innerHTML='Running…';
+  document.getElementById('runBtn').disabled=true;
+  setStatus('queued');
+  let res;
+  try { res = await fetch('/run',{method:'POST',body:fd}); }
+  catch(e){ addLog('Network error: '+e, true); document.getElementById('runBtn').disabled=false; return; }
+  if (!res.ok){ addLog('Error: '+await res.text(), true); document.getElementById('runBtn').disabled=false; return; }
+  const {job_id} = await res.json();
+  currentJob = job_id;
+  document.getElementById('cancelBtn').disabled=false;
+  setStatus('running');
+
+  const ev = new EventSource(`/jobs/${job_id}/stream`);
+  ev.onmessage = e => addLog(e.data);
+  ev.addEventListener('end', e => {
+    ev.close();
+    setStatus(e.data);
+    document.getElementById('runBtn').disabled=false;
+    document.getElementById('cancelBtn').disabled=true;
+    if (e.data==='done'){
+      document.getElementById('downloads').innerHTML =
+        `<a class="dl" href="/jobs/${job_id}/download/results.csv">⬇ results.csv</a>` +
+        `<a class="dl" href="/jobs/${job_id}/download/poses.sdf">⬇ poses.sdf</a>`;
+    } else {
+      document.getElementById('downloads').innerHTML = `Run ${e.data}.`;
+    }
+  });
+  ev.onerror = ()=>{ /* keep retrying until end event */ };
+});
+
+document.getElementById('cancelBtn').addEventListener('click', async ()=>{
+  if (!currentJob) return;
+  await fetch(`/jobs/${currentJob}/cancel`,{method:'POST'});
+  addLog('Cancel requested…');
+});
+</script>
+</body>
+</html>

@@ -3,9 +3,15 @@ import warnings
 from abc import ABC, abstractmethod
 import numpy as np
 from rdkit import Chem
-from rdkit.Chem import rdFingerprintGenerator
+from rdkit.Chem import rdFingerprintGenerator, Descriptors
 
-import useful_rdkit_utils as uru
+try:
+    import useful_rdkit_utils as uru
+except ImportError:
+    # useful_rdkit_utils requires Python >= 3.10; it is only needed by
+    # MWEvaluator (which falls back to RDKit below) and MLClassifierEvaluator.
+    uru = None
+    warnings.warn("useful_rdkit_utils not available; MLClassifierEvaluator will be unusable.")
 
 try:
     from openeye import oechem
@@ -45,7 +51,7 @@ class MWEvaluator(Evaluator):
 
     def evaluate(self, mol):
         self.num_evaluations += 1
-        return uru.MolWt(mol)
+        return Descriptors.MolWt(mol)
 
 
 class FPEvaluator(Evaluator):

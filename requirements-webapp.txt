@@ -1,0 +1,18 @@
+# Extra dependencies for the Thompson Sampling + GNINA web app (ts_webapp.py).
+# Install on top of an env that already has the TS core deps
+# (rdkit, numpy, pandas, tqdm) on Python >= 3.10.
+#
+#   conda create -n ts_gnina -c conda-forge python=3.11 rdkit numpy pandas tqdm
+#   conda activate ts_gnina
+#   pip install -r requirements-webapp.txt
+#
+# External tools (not pip-installable here):
+#   - gnina   binary  (GNINA_PATH, default /opt/gnina/gnina.1.3.2)
+#   - obabel  (OpenBabel >= 3.1, on PATH)            used for ligand protonation
+fastapi
+uvicorn[standard]
+python-multipart
+aiofiles
+useful-rdkit-utils
+sqlitedict
+jinja2
