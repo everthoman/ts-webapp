@@ -1,0 +1,17 @@
+[Unit]
+Description=Thompson Sampling + GNINA Docking Web App
+After=network.target
+
+[Service]
+Type=simple
+User=evehom
+WorkingDirectory=/opt/webapps/TS
+ExecStart=/home/evehom/Programs/miniconda3/envs/ts_gnina/bin/uvicorn ts_webapp:app --host 0.0.0.0 --port 5014
+Environment="GNINA_PATH=/opt/gnina/gnina.1.3.2"
+Environment="LIGPREPPER_DIR=/opt/webapps/ligprepper"
+Environment="TS_DOCK_GPU=0"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

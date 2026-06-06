@@ -70,6 +70,27 @@ Then in the browser:
 6. **Run** — watch the live log; download `results.csv` (ranked unique products) and
    `poses.sdf` (best docked pose per top product) when finished. **Cancel** stops the run.
 
+## Run as a systemd service
+
+A unit file `ts-gnina-webapp.service` is provided (runs on `0.0.0.0:5014`,
+reachable at http://130.237.250.75:5014). Install it:
+
+```bash
+pkill -f "uvicorn ts_webapp:app"          # stop any temporary instance first
+sudo cp /opt/webapps/TS/ts-gnina-webapp.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ts-gnina-webapp
+sudo systemctl status ts-gnina-webapp --no-pager
+```
+
+Logs: `journalctl -u ts-gnina-webapp -f`. Restart after code changes:
+`sudo systemctl restart ts-gnina-webapp`.
+
+Firewall (KTH network only):
+```bash
+sudo ufw allow from 130.237.0.0/16 to any port 5014 proto tcp comment 'TS+GNINA webapp (KTH only)'
+```
+
 ## Configuration (environment variables)
 
 | Variable | Default | Purpose |
