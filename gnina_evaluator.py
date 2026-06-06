@@ -50,6 +50,14 @@ GNINA_PATH = os.environ.get("GNINA_PATH", "/opt/gnina/gnina.1.3.2")
 OBABEL_PATH = os.environ.get("OBABEL_PATH", "obabel")
 LIGPREPPER_DIR = os.environ.get("LIGPREPPER_DIR", "/opt/webapps/ligprepper")
 
+# CPU budget for the gnina search. Thompson Sampling docks one molecule at a
+# time (the search loop is sequential), so a single gnina process can use most
+# of the machine rather than the per-GPU slice the gnina web app uses for its
+# parallel ligand batches. Reserve a few cores for the web server / TS loop.
+N_CPU = int(os.environ.get("N_CPU", os.cpu_count() or 1))
+RESERVED_CPU = int(os.environ.get("TS_RESERVED_CPU", "4"))
+DOCK_CPU = max(1, int(os.environ.get("TS_DOCK_CPU", str(max(1, N_CPU - RESERVED_CPU)))))
+
 # Score fields where a *higher* value means a better pose.
 _HIGHER_IS_BETTER_FIELDS = {"CNNscore", "CNNaffinity", "CNN_VS"}
 
@@ -336,7 +344,7 @@ class GninaEvaluator(Evaluator):
         self.gnina_path = input_dict.get("gnina_path", GNINA_PATH)
         self.seed = int(input_dict.get("seed", 666))
         self.timeout = int(input_dict.get("timeout", 600))
-        self.cpu = int(input_dict.get("cpu", 4))
+        self.cpu = int(input_dict.get("cpu") or DOCK_CPU)
 
         self.filters: Optional[MolFilters] = input_dict.get("filters")
         self.cancel_event = input_dict.get("cancel_event")  # threading.Event or None

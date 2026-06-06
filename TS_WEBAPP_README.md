@@ -99,6 +99,8 @@ sudo ufw allow from 130.237.0.0/16 to any port 5014 proto tcp comment 'TS+GNINA 
 | `OBABEL_PATH` | `obabel` | OpenBabel binary |
 | `LIGPREPPER_DIR` | `/opt/webapps/ligprepper` | dir holding `PAINS.txt` / `REOS.txt` |
 | `TS_DOCK_GPU` | `0` | default CUDA device (overridable per run in the UI) |
+| `TS_DOCK_CPU` | `N_CPU - 4` | `--cpu` threads per gnina dock. TS docks one molecule at a time, so each dock gets most of the box. |
+| `TS_RESERVED_CPU` | `4` | cores held back from each dock for the web server / TS loop |
 | `TS_WEBAPP_PORT` | `5014` | server port |
 | `TS_GNINA_ENV` | `ts_gnina` | conda env used by `run_webapp.sh` |
 
