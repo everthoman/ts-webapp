@@ -381,6 +381,11 @@ class GninaEvaluator(Evaluator):
                 key = reason.split(":")[0].split(" ")[0]
                 self.rejections[key] = self.rejections.get(key, 0) + 1
                 self._score_cache[smiles] = np.nan
+                total_rej = sum(self.rejections.values())
+                if self.progress_callback is not None and total_rej % 100 == 0:
+                    self.progress_callback(
+                        f"filtered {total_rej} products so far (pre-dock) {dict(self.rejections)}"
+                    )
                 return np.nan
 
         score = self._dock(smiles)

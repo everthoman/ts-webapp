@@ -217,7 +217,30 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
             est = sum(len(rl) for rl in sampler.reagent_lists) * n_warm
             job.log(f"Warm-up: ~{est} docking calls (then {ts.get('num_ts_iterations')} search iterations)")
 
-            warmup_results = sampler.warm_up(num_warmup_trials=n_warm)
+            try:
+                warmup_results = sampler.warm_up(num_warmup_trials=n_warm)
+            except ValueError:
+                # warm_up() computes np.min/np.mean over the finite warm-up
+                # scores; if every product was filtered out or failed to dock
+                # that array is empty and numpy raises. Turn it into guidance.
+                st = evaluator.stats()
+                rej = sum(st["rejections"].values())
+                raise RuntimeError(
+                    "Warm-up produced no scorable products — nothing to build a prior from. "
+                    f"Of the products tried: {rej} filtered out before docking "
+                    f"({st['rejections'] or 'none'}), {st['prep_failures']} ligand-prep failures, "
+                    f"{st['dock_failures']} docking failures. "
+                    "Loosen the MW/logP ranges or PAINS/REOS filters, or check that the "
+                    "reaction and receptor/binding site are correct."
+                )
+            if not warmup_results:
+                st = evaluator.stats()
+                raise RuntimeError(
+                    "Warm-up produced no scorable products. "
+                    f"Filtered out: {sum(st['rejections'].values())} {st['rejections'] or ''}; "
+                    f"prep failures: {st['prep_failures']}; dock failures: {st['dock_failures']}. "
+                    "Loosen the filters or check the reaction/receptor."
+                )
             try:
                 search_results = sampler.search(num_cycles=int(ts.get("num_ts_iterations", 100)))
             except ValueError as e:
