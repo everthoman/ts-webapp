@@ -182,7 +182,7 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
             eval_dict = {
                 "receptor_path": str(job.dir / "receptor.pdb"),
                 "score_field": gnina["score_field"],
-                "cnn_scoring": gnina.get("cnn_scoring", "rescore"),
+                "cnn_scoring": gnina.get("cnn_scoring", "none"),
                 "exhaustiveness": gnina.get("exhaustiveness", 8),
                 "num_modes": gnina.get("num_modes", 9),
                 "autobox_add": gnina.get("autobox_add", 4.0),

@@ -65,6 +65,10 @@ Then in the browser:
    **reference ligand SDF** (autobox) or **XYZ + box edge**.
 3. **GNINA** — score field (default `minimizedAffinity`, minimize; `CNNaffinity` /
    `CNN_VS` maximize), CNN scoring mode, exhaustiveness, poses, LigPrep pH.
+   **CNN scoring defaults to `none`**: pure Vina docking that runs on CPU (each
+   dock uses `TS_DOCK_CPU` cores) and needs no GPU — much faster for a long TS
+   run. Selecting a CNN mode (`rescore`/`all`) enables CNN rescoring on the
+   chosen GPU id; the GPU is otherwise unused.
 4. **Filters** — toggle PAINS / REOS, set optional MW / logP ranges (blank = off).
 5. **Thompson Sampling** — warm-up trials per reagent, search iterations, GPU id.
 6. **Run** — watch the live log; download `results.csv` (ranked unique products) and

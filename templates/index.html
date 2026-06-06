@@ -99,9 +99,9 @@
         <div>
           <label>CNN scoring</label>
           <select id="cnnScoring">
-            <option value="rescore" selected>rescore</option>
-            <option value="none">none (Vina only, fastest)</option>
-            <option value="all">all</option>
+            <option value="none" selected>none (Vina only, CPU, fastest)</option>
+            <option value="rescore">rescore (CNN, GPU)</option>
+            <option value="all">all (CNN, GPU)</option>
           </select>
         </div>
       </div>
@@ -130,7 +130,7 @@
       <div class="grid3">
         <div><label>Warm-up trials / reagent</label><input type="number" id="warmup" value="2" min="1"></div>
         <div><label>Search iterations</label><input type="number" id="iters" value="100" min="1"></div>
-        <div><label>GPU id</label><input type="number" id="gpu" value="0" min="0"></div>
+        <div><label>GPU id <span class="chip">(CNN modes only)</span></label><input type="number" id="gpu" value="0" min="0"></div>
       </div>
       <div class="note" id="costNote"></div>
     </div>

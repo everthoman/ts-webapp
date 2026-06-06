@@ -335,7 +335,7 @@ class GninaEvaluator(Evaluator):
 
         self.score_field = input_dict.get("score_field", "minimizedAffinity")
         self.higher_is_better = score_field_is_higher_better(self.score_field)
-        self.cnn_scoring = input_dict.get("cnn_scoring", "rescore")
+        self.cnn_scoring = input_dict.get("cnn_scoring", "none")
         self.exhaustiveness = int(input_dict.get("exhaustiveness", 8))
         self.num_modes = int(input_dict.get("num_modes", 9))
         self.autobox_add = float(input_dict.get("autobox_add", 4.0))
@@ -435,7 +435,14 @@ class GninaEvaluator(Evaluator):
         ]
 
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        # CNN scoring is the GPU-bound step. With cnn_scoring="none" gnina does
+        # pure (CPU) Vina docking, which is much faster here and needs no GPU —
+        # so hide the GPUs entirely to avoid contention. Only expose a GPU when
+        # a CNN mode is actually requested.
+        if self.cnn_scoring == "none":
+            env["CUDA_VISIBLE_DEVICES"] = ""
+        else:
+            env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
 
         try:
             proc = subprocess.run(
