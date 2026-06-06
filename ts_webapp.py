@@ -39,7 +39,7 @@ BASE_DIR = Path(__file__).resolve().parent
 JOBS_DIR = BASE_DIR / "jobs"
 JOBS_DIR.mkdir(exist_ok=True)
 INDEX_HTML = (BASE_DIR / "templates" / "index.html").read_text()
-PORT = int(os.environ.get("TS_WEBAPP_PORT", "5011"))
+PORT = int(os.environ.get("TS_WEBAPP_PORT", "5014"))
 
 with open(BASE_DIR / "reactions.json") as fh:
     CATALOG = json.load(fh)

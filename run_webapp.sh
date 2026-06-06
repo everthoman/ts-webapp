@@ -8,7 +8,8 @@ cd "$HERE"
 
 ENV_NAME="${TS_GNINA_ENV:-ts_gnina}"
 HOST="${TS_WEBAPP_HOST:-0.0.0.0}"
-PORT="${TS_WEBAPP_PORT:-5011}"
+# Reachable at http://130.237.250.75:5014
+PORT="${TS_WEBAPP_PORT:-5014}"
 
 # conda run works whether or not the env is active in the current shell.
 exec conda run --no-capture-output -n "$ENV_NAME" \

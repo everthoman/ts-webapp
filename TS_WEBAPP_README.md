@@ -55,7 +55,7 @@ External tools (must already be installed):
 ## Run
 
 ```bash
-./run_webapp.sh           # http://localhost:5011
+./run_webapp.sh           # http://localhost:5014
 ```
 
 Then in the browser:
@@ -78,7 +78,7 @@ Then in the browser:
 | `OBABEL_PATH` | `obabel` | OpenBabel binary |
 | `LIGPREPPER_DIR` | `/opt/webapps/ligprepper` | dir holding `PAINS.txt` / `REOS.txt` |
 | `TS_DOCK_GPU` | `0` | default CUDA device (overridable per run in the UI) |
-| `TS_WEBAPP_PORT` | `5011` | server port |
+| `TS_WEBAPP_PORT` | `5014` | server port |
 | `TS_GNINA_ENV` | `ts_gnina` | conda env used by `run_webapp.sh` |
 
 ## Cost note

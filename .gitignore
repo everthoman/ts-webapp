@@ -159,5 +159,7 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# TS+GNINA web app per-job working dirs
+# TS+GNINA web app per-job working dirs and runtime logs
 jobs/
+ts_webapp.out
+ts_webapp.log
