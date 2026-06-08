@@ -154,6 +154,22 @@ def _read_meta(job_dir: Path) -> dict:
     return {}
 
 
+def _job_dir(job_id: str) -> Optional[Path]:
+    """Resolve a job's directory from the live registry, falling back to disk so
+    that *past* runs (not in the in-memory JOBS dict) are still viewable.
+    Returns None if it doesn't exist or escapes JOBS_DIR (path-traversal guard)."""
+    job = JOBS.get(job_id)
+    if job is not None:
+        return job.dir
+    d = (JOBS_DIR / job_id)
+    try:
+        if d.is_dir() and d.resolve().parent == JOBS_DIR.resolve():
+            return d
+    except Exception:
+        pass
+    return None
+
+
 def _slugify(name: str) -> str:
     """Turn a user session name into a safe directory/job id (no path traversal)."""
     slug = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip()).strip("._-")
@@ -640,10 +656,10 @@ def _mol_svg(smiles: str, width: int = 230, height: int = 180) -> str:
 @app.get("/jobs/{job_id}/top")
 async def top(job_id: str, n: int = 12):
     """Top-N ranked products with structure SVG, score and reagent combination."""
-    job = JOBS.get(job_id)
-    if job is None:
+    d = _job_dir(job_id)
+    if d is None:
         raise HTTPException(404, "Unknown job")
-    csv_path = job.dir / "results.csv"
+    csv_path = d / "results.csv"
     if not csv_path.is_file():
         return {"ready": False, "items": []}
     try:
@@ -666,15 +682,29 @@ async def top(job_id: str, n: int = 12):
 
 @app.get("/jobs/{job_id}/download/{name}")
 async def download(job_id: str, name: str):
-    job = JOBS.get(job_id)
-    if job is None:
+    d = _job_dir(job_id)
+    if d is None:
         raise HTTPException(404, "Unknown job")
     if name not in ("results.csv", "poses.sdf", "run.log"):
         raise HTTPException(400, "Invalid file")
-    path = job.dir / name
+    path = d / name
     if not path.is_file():
         raise HTTPException(404, "Not ready")
     return FileResponse(str(path), filename=f"ts_gnina_{job_id}_{name}")
+
+
+@app.delete("/jobs/{job_id}")
+async def delete_job(job_id: str):
+    """Delete a run's directory (prune clutter). Refuses a running job."""
+    live = JOBS.get(job_id)
+    if live is not None and live.status in ("queued", "running"):
+        raise HTTPException(409, "Cannot delete a running job; cancel it first")
+    d = _job_dir(job_id)
+    if d is None:
+        raise HTTPException(404, "Unknown job")
+    shutil.rmtree(d, ignore_errors=True)
+    JOBS.pop(job_id, None)
+    return {"deleted": job_id}
 
 
 if __name__ == "__main__":

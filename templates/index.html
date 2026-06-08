@@ -48,7 +48,11 @@
   .card .score { font-weight:700; }
   .card .name { color:#555; word-break:break-all; }
   .card .smi { color:#999; word-break:break-all; font-family: ui-monospace, Menlo, monospace; }
+  #jobList { max-height:320px; overflow:auto; }
+  .jobtoggle { text-align:center; font-size:12px; color:var(--accent); cursor:pointer; padding:4px; }
   .jobrow { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:7px 8px; border:1px solid #2f3a57; border-radius:7px; margin-bottom:6px; background:#131a29; }
+  .jobrow.sel { border-color:var(--accent); }
+  .jobrow button.del { background:#3a2330; color:var(--err); }
   .jobrow .jmain { min-width:0; } .jobrow b { font-size:13px; } .jobrow .sub { font-size:11px; color:var(--muted); }
   .jobrow .jbtns { flex:0 0 auto; display:flex; gap:6px; }
   .jobrow button { padding:4px 9px; font-size:12px; }
@@ -446,13 +450,17 @@ async function runPreflight(){
 document.getElementById('preflightBtn').addEventListener('click', runPreflight);
 
 // ---- Job history ----
+let showAllJobs = false;
+const JOBS_SHOWN = 8;
 function jobPill(s){ return `<span class="pill status-${s}">${s}</span>`; }
 async function refreshJobs(){
   let data;
   try { data = await (await fetch('/jobs')).json(); } catch(e){ return; }
   const jl = document.getElementById('jobList');
   if (!data.jobs.length){ jl.innerHTML = '<span class="muted">No runs yet.</span>'; return; }
-  jl.innerHTML = data.jobs.map(j=>{
+  const all = data.jobs;
+  const shown = showAllJobs ? all : all.slice(0, JOBS_SHOWN);
+  const rows = shown.map(j=>{
     const sub = [
       j.n_results!=null ? `${j.n_results} hits` : null,
       j.top ? `best ${(+j.top.score).toFixed(2)}` : null,
@@ -460,14 +468,29 @@ async function refreshJobs(){
       j.started || null,
     ].filter(Boolean).join(' · ');
     const rerunBtn = j.can_rerun ? `<button class="btn ghost" data-act="rerun" data-id="${esc(j.id)}">rerun</button>` : '';
-    return `<div class="jobrow"><div class="jmain">
+    const sel = j.id===currentJob ? ' sel' : '';
+    return `<div class="jobrow${sel}"><div class="jmain">
         ${jobPill(j.status)} <b>${esc(j.id)}</b>
         <div class="sub">${esc(sub)}</div>
       </div><div class="jbtns">
         <button class="btn ghost" data-act="view" data-id="${esc(j.id)}" data-status="${j.status}">view</button>
         ${rerunBtn}
+        <button class="del" data-act="del" data-id="${esc(j.id)}" title="delete">✕</button>
       </div></div>`;
   }).join('');
+  const toggle = all.length > JOBS_SHOWN
+    ? `<div class="jobtoggle" data-act="toggle">${showAllJobs ? 'show less' : `show all (${all.length})`}</div>`
+    : '';
+  jl.innerHTML = rows + toggle;
+}
+async function deleteJob(id){
+  if (!confirm(`Delete run "${id}"? This removes its results from disk.`)) return;
+  try {
+    const r = await fetch(`/jobs/${id}`, {method:'DELETE'});
+    if (!r.ok){ alert('Delete failed: '+await r.text()); return; }
+  } catch(e){ alert('Network error'); return; }
+  if (currentJob===id) currentJob = null;
+  refreshJobs();
 }
 async function loadStaticLog(id){
   logEl.innerHTML='';
@@ -494,9 +517,12 @@ async function rerunJob(id){
   attachStream(job_id); refreshJobs();
 }
 document.getElementById('jobList').addEventListener('click', e=>{
-  const b = e.target.closest('button[data-act]'); if(!b) return;
-  if (b.dataset.act==='view') viewJob(b.dataset.id, b.dataset.status);
-  else if (b.dataset.act==='rerun') rerunJob(b.dataset.id);
+  const t = e.target.closest('[data-act]'); if(!t) return;
+  const act = t.dataset.act;
+  if (act==='view') viewJob(t.dataset.id, t.dataset.status);
+  else if (act==='rerun') rerunJob(t.dataset.id);
+  else if (act==='del') deleteJob(t.dataset.id);
+  else if (act==='toggle'){ showAllJobs = !showAllJobs; refreshJobs(); }
 });
 document.getElementById('refreshJobs').addEventListener('click', refreshJobs);
 refreshJobs();
