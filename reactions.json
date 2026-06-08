@@ -7,7 +7,10 @@
     "carboxylic_acids_500": {"file": "data/carboxylic_acids_500.smi", "count": 500,   "label": "Carboxylic acids (500)"},
     "carboxylic_acids_ok":  {"file": "data/carboxylic_acids_ok.smi",  "count": 4214,  "label": "Carboxylic acids (full, 4214)"},
     "aminobenzoic_100":     {"file": "data/aminobenzoic_100.smi",     "count": 100,   "label": "Aminobenzoic acids (100)"},
-    "aminobenzoic_ok":      {"file": "data/aminobenzoic_ok.smi",      "count": 376,   "label": "Aminobenzoic acids (full, 376)"}
+    "aminobenzoic_ok":      {"file": "data/aminobenzoic_ok.smi",      "count": 376,   "label": "Aminobenzoic acids (full, 376)"},
+    "aryl_halides_100":     {"file": "data/aryl_halides_100.smi",     "count": 100,   "label": "Aryl/heteroaryl halides (100)"},
+    "boronic_acids_100":    {"file": "data/boronic_acids_100.smi",    "count": 100,   "label": "Aryl boronic acids (100)"},
+    "activated_aryl_halides_100": {"file": "data/activated_aryl_halides_100.smi", "count": 100, "label": "Activated aryl halides (100)"}
   },
   "reactions": [
     {
@@ -22,15 +25,25 @@
       ]
     },
     {
-      "id": "quinazolinone",
-      "name": "Quinazolinone (aminobenzoic acid + amine + acid)",
+      "id": "suzuki",
+      "name": "Suzuki coupling (aryl halide + boronic acid)",
       "role": "start",
       "takes_intermediate": false,
-      "smarts": "N[c:4][c:3]C(O)=O.[#6:1][NH2].[#6:2]C(=O)[OH]>>[C:2]c1n[c:4][c:3]c(=O)n1[C:1]",
+      "smarts": "[c:1][Cl,Br,I].[c:2][B]([OX2])[OX2]>>[c:1][c:2]",
       "components": [
-        {"label": "Aminobenzoic acid", "sets": ["aminobenzoic_100", "aminobenzoic_ok"]},
-        {"label": "Primary amine",     "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]},
-        {"label": "Carboxylic acid",   "sets": ["carboxylic_acids_100", "carboxylic_acids_500", "carboxylic_acids_ok"]}
+        {"label": "Aryl halide",   "sets": ["aryl_halides_100"]},
+        {"label": "Boronic acid",  "sets": ["boronic_acids_100"]}
+      ]
+    },
+    {
+      "id": "snar",
+      "name": "Nucleophilic aromatic substitution (SNAr)",
+      "role": "start",
+      "takes_intermediate": false,
+      "smarts": "[c:1][F,Cl].[NX3;H1,H2:2]>>[c:1][N:2]",
+      "components": [
+        {"label": "Activated aryl halide", "sets": ["activated_aryl_halides_100"]},
+        {"label": "Primary amine",         "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]}
       ]
     },
     {

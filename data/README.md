@@ -22,6 +22,18 @@ aminobenzoic_ok.smi  - 376 aminobenzoic acids
 aminobenzoic_100.smi - 100 aminobenzoic acids
 
 
+### Suzuki library
+aryl_halides_100.smi  - 100 aryl/heteroaryl halides (coupling electrophile)
+boronic_acids_100.smi - 100 aryl boronic acids (coupling nucleophile)
+
+### SNAr library
+activated_aryl_halides_100.smi - 100 EWG-activated aryl fluorides/chlorides (electrophile)
+primary_amines_*.smi           - amine nucleophile (shared with the amide library)
+
+> The Suzuki / SNAr sets are small curated *example* libraries generated and
+> reaction-validated by `_gen_suzuki_snar.py`; regenerate with that script.
+
+
 ### ROCS
 2chw_lig.sdf - reference ligand for the ROCS example
 
