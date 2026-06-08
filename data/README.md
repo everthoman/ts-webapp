@@ -33,6 +33,13 @@ primary_amines_*.smi           - amine nucleophile (shared with the amide librar
 > The Suzuki / SNAr sets are small curated *example* libraries generated and
 > reaction-validated by `_gen_suzuki_snar.py`; regenerate with that script.
 
+### Reductive amination library
+aldehydes_ketones_100.smi - 100 aldehydes/ketones (carbonyl electrophile)
+primary_amines_*.smi      - amine nucleophile (shared with the amide library)
+
+> Curated *example* library generated and reaction-validated by
+> `_gen_reductive_amination.py`; regenerate with that script.
+
 
 ### ROCS
 2chw_lig.sdf - reference ligand for the ROCS example

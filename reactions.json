@@ -10,7 +10,8 @@
     "aminobenzoic_ok":      {"file": "data/aminobenzoic_ok.smi",      "count": 376,   "label": "Aminobenzoic acids (full, 376)"},
     "aryl_halides_100":     {"file": "data/aryl_halides_100.smi",     "count": 100,   "label": "Aryl/heteroaryl halides (100)"},
     "boronic_acids_100":    {"file": "data/boronic_acids_100.smi",    "count": 100,   "label": "Aryl boronic acids (100)"},
-    "activated_aryl_halides_100": {"file": "data/activated_aryl_halides_100.smi", "count": 100, "label": "Activated aryl halides (100)"}
+    "activated_aryl_halides_100": {"file": "data/activated_aryl_halides_100.smi", "count": 100, "label": "Activated aryl halides (100)"},
+    "aldehydes_ketones_100": {"file": "data/aldehydes_ketones_100.smi", "count": 100, "label": "Aldehydes/ketones (100)"}
   },
   "reactions": [
     {
@@ -44,6 +45,17 @@
       "components": [
         {"label": "Activated aryl halide", "sets": ["activated_aryl_halides_100"]},
         {"label": "Primary amine",         "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]}
+      ]
+    },
+    {
+      "id": "reductive_amination",
+      "name": "Reductive amination (aldehyde/ketone + amine)",
+      "role": "start",
+      "takes_intermediate": false,
+      "smarts": "[$([CX3H1]=O),$([CX3]([#6])([#6])=O);!$([CX3](=O)[OX2]);!$([CX3](=O)[#7]):1]=[OX1].[NX3;H1,H2;!$([NX3]C=O):2]>>[C:1][N:2]",
+      "components": [
+        {"label": "Aldehyde/ketone", "sets": ["aldehydes_ketones_100"]},
+        {"label": "Primary amine",   "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]}
       ]
     },
     {
