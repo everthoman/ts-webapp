@@ -33,6 +33,8 @@ import numpy as np
 import pandas as pd
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from rdkit import Chem
+from rdkit.Chem.Draw import rdMolDraw2D
 
 from gnina_evaluator import GninaEvaluator, MolFilters, DockingCancelled, GNINA_PATH, DOCK_CPU
 from route_sampler import RouteSampler
@@ -444,6 +446,47 @@ async def cancel(job_id: str):
         raise HTTPException(404, "Unknown job")
     job.cancel_event.set()
     return {"status": "cancelling"}
+
+
+def _mol_svg(smiles: str, width: int = 230, height: int = 180) -> str:
+    """Render a SMILES to an inline SVG (XML declaration stripped)."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return ""
+    drawer = rdMolDraw2D.MolDraw2DSVG(width, height)
+    drawer.drawOptions().padding = 0.08
+    rdMolDraw2D.PrepareAndDrawMolecule(drawer, mol)
+    drawer.FinishDrawing()
+    svg = drawer.GetDrawingText()
+    i = svg.find("<svg")
+    return svg[i:] if i != -1 else svg
+
+
+@app.get("/jobs/{job_id}/top")
+async def top(job_id: str, n: int = 12):
+    """Top-N ranked products with structure SVG, score and reagent combination."""
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Unknown job")
+    csv_path = job.dir / "results.csv"
+    if not csv_path.is_file():
+        return {"ready": False, "items": []}
+    try:
+        df = pd.read_csv(csv_path)  # already sorted best-first and deduped
+    except Exception:
+        return {"ready": False, "items": []}
+    n = max(1, min(int(n), 60))
+    items = []
+    for rank, row in enumerate(df.head(n).itertuples(index=False), start=1):
+        smiles = str(row.SMILES)
+        items.append({
+            "rank": rank,
+            "score": round(float(row.score), 3),
+            "smiles": smiles,
+            "name": str(row.Name),
+            "svg": _mol_svg(smiles),
+        })
+    return {"ready": True, "items": items, "total": int(len(df))}
 
 
 @app.get("/jobs/{job_id}/download/{name}")

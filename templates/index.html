@@ -38,6 +38,16 @@
   .note { font-size:12px; color:var(--warn); margin-top:8px; }
   a.dl { color:var(--accent); font-size:13px; margin-right:16px; }
   .bad { color:var(--err); }
+  .topbar { display:flex; gap:10px; align-items:center; margin-bottom:4px; }
+  .topbar select { width:80px; }
+  .topgrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(160px,1fr)); gap:12px; margin-top:12px; }
+  .card { background:#fff; border:1px solid #2a3550; border-radius:8px; padding:8px; }
+  .card svg { width:100%; height:auto; display:block; }
+  .card .meta { margin-top:6px; font-size:11px; color:#222; line-height:1.45; }
+  .card .rank { font-weight:700; color:#234a7a; }
+  .card .score { font-weight:700; }
+  .card .name { color:#555; word-break:break-all; }
+  .card .smi { color:#999; word-break:break-all; font-family: ui-monospace, Menlo, monospace; }
 </style>
 </head>
 <body>
@@ -155,6 +165,17 @@
       <h2>Run status <span id="statusPill" class="pill status-queued" style="display:none"></span></h2>
       <div id="downloads" class="muted">No results yet.</div>
       <div id="log" style="margin-top:10px"><span class="muted">Logs will stream here…</span></div>
+    </div>
+
+    <div class="panel" id="topPanel" style="display:none">
+      <h2>Top ranked ligands</h2>
+      <div class="topbar">
+        <span class="muted">Show top</span>
+        <select id="topN"><option>6</option><option selected>12</option><option>24</option><option>48</option></select>
+        <button class="btn ghost" id="refreshTop" type="button">refresh</button>
+        <span class="muted" id="topMeta"></span>
+      </div>
+      <div id="topGrid" class="topgrid"></div>
     </div>
   </div>
 </div>
@@ -294,6 +315,32 @@ const pill = document.getElementById('statusPill');
 function setStatus(s){ pill.style.display='inline-block'; pill.className='pill status-'+s; pill.textContent=s; }
 function addLog(line, bad){ const d=document.createElement('div'); if(bad)d.className='bad'; d.textContent=line; logEl.appendChild(d); logEl.scrollTop=logEl.scrollHeight; }
 
+const topPanel = document.getElementById('topPanel');
+const topGrid = document.getElementById('topGrid');
+const topNsel = document.getElementById('topN');
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+async function loadTop(){
+  if(!currentJob) return;
+  const n = parseInt(topNsel.value);
+  topGrid.innerHTML = '<span class="muted">Loading…</span>';
+  let data;
+  try { data = await (await fetch(`/jobs/${currentJob}/top?n=${n}`)).json(); }
+  catch(e){ topGrid.innerHTML = '<span class="muted">Error loading results.</span>'; return; }
+  if(!data.ready || !data.items.length){ topGrid.innerHTML = '<span class="muted">No results yet.</span>'; return; }
+  document.getElementById('topMeta').textContent = `of ${data.total} unique molecules`;
+  topGrid.innerHTML = data.items.map(it => `
+    <div class="card">
+      ${it.svg || '<div class="muted" style="color:#888">no structure</div>'}
+      <div class="meta">
+        <span class="rank">#${it.rank}</span> &middot; <span class="score">${it.score}</span>
+        <div class="name" title="${esc(it.name)}">${esc(it.name)}</div>
+        <div class="smi" title="${esc(it.smiles)}">${esc(it.smiles)}</div>
+      </div>
+    </div>`).join('');
+}
+document.getElementById('refreshTop').addEventListener('click', loadTop);
+topNsel.addEventListener('change', loadTop);
+
 document.getElementById('runBtn').addEventListener('click', async ()=>{
   const recEl = document.getElementById('receptor');
   if (!recEl.files.length){ alert('Please upload a receptor PDB.'); return; }
@@ -307,6 +354,7 @@ document.getElementById('runBtn').addEventListener('click', async ()=>{
   if (bsMode==='reference') fd.append('reference', refEl.files[0]);
 
   logEl.innerHTML=''; document.getElementById('downloads').innerHTML='Running…';
+  topPanel.style.display='none'; topGrid.innerHTML='';
   document.getElementById('runBtn').disabled=true;
   setStatus('queued');
   let res;
@@ -331,6 +379,8 @@ document.getElementById('runBtn').addEventListener('click', async ()=>{
         `<a class="dl" href="/jobs/${job_id}/download/results.csv">⬇ results.csv</a>` +
         `<a class="dl" href="/jobs/${job_id}/download/poses.sdf">⬇ poses.sdf</a>` +
         logLink;
+      topPanel.style.display='';
+      loadTop();
     } else {
       document.getElementById('downloads').innerHTML = `Run ${e.data}. ` + logLink;
     }
