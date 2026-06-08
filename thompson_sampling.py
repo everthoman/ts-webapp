@@ -156,9 +156,24 @@ class ThompsonSampler:
 
     def _score_product(self, prod_mol, product_name: str) -> float:
         """Score one product. This is the slow (docking) step run in parallel."""
+        return self._score_product_detailed(prod_mol, product_name)[0]
+
+    def _score_product_detailed(self, prod_mol, product_name: str):
+        """Score one product, returning ``(score, reason)``.
+
+        ``reason`` is ``None`` for a real score, ``"filtered"`` if the evaluator
+        rejected it pre-dock, or ``"fail"`` for a prep/dock failure. Evaluators
+        that don't classify failures (no ``evaluate_detailed``) report ``"fail"``
+        for any non-finite score.
+        """
         if isinstance(self.evaluator, DBEvaluator):
-            return float(self.evaluator.evaluate(product_name))
-        return self.evaluator.evaluate(prod_mol)
+            score = float(self.evaluator.evaluate(product_name))
+            return score, (None if np.isfinite(score) else "fail")
+        detailed = getattr(self.evaluator, "evaluate_detailed", None)
+        if detailed is not None:
+            return detailed(prod_mol)
+        score = self.evaluator.evaluate(prod_mol)
+        return score, (None if np.isfinite(score) else "fail")
 
     def _record(self, selected_reagents, score: float) -> None:
         """Record a finite score against each contributing reagent."""
@@ -178,25 +193,30 @@ class ThompsonSampler:
             self._record(selected_reagents, res)
         return product_smiles, product_name, res
 
-    def evaluate_batch(self, choice_lists: List[List[int]]) -> List[Tuple[str, str, float]]:
+    def evaluate_batch(self, choice_lists: List[List[int]]) -> List[Tuple[str, str, float, Optional[str]]]:
         """Evaluate several reagent sets, docking up to ``self.concurrency`` at once.
 
         Products are built (cheap) on the calling thread, docked in parallel,
         then scores are recorded into the reagents single-threaded so the TS
         bookkeeping is identical to the sequential path. Returns one
-        ``(smiles, name, score)`` per input, in input order.
+        ``(smiles, name, score, reason)`` per input, in input order. ``reason``
+        is ``None`` for a real score, ``"reaction"`` if the reaction did not fire,
+        ``"filtered"`` if a hard filter rejected it, or ``"fail"`` for a prep/dock
+        failure.
         """
         built = [self._build_product(cl) for cl in choice_lists]
         scores: List[float] = [np.nan] * len(built)
+        # Products that did not build = reaction never fired.
+        reasons: List[Optional[str]] = ["reaction" if b[0] is None else None for b in built]
         dock_idx = [i for i, b in enumerate(built) if b[0] is not None]
 
         if self.concurrency > 1 and len(dock_idx) > 1:
             pending_exc = None
             with ThreadPoolExecutor(max_workers=self.concurrency) as ex:
-                futs = {ex.submit(self._score_product, built[i][0], built[i][2]): i for i in dock_idx}
+                futs = {ex.submit(self._score_product_detailed, built[i][0], built[i][2]): i for i in dock_idx}
                 for fut in as_completed(futs):
                     try:
-                        scores[futs[fut]] = fut.result()
+                        scores[futs[fut]], reasons[futs[fut]] = fut.result()
                     except Exception as e:  # e.g. DockingCancelled
                         pending_exc = e
                         for f in futs:
@@ -206,12 +226,12 @@ class ThompsonSampler:
                 raise pending_exc
         else:
             for i in dock_idx:
-                scores[i] = self._score_product(built[i][0], built[i][2])
+                scores[i], reasons[i] = self._score_product_detailed(built[i][0], built[i][2])
 
         out = []
         for i, (_pm, smiles, name, selected_reagents) in enumerate(built):
             self._record(selected_reagents, scores[i])
-            out.append((smiles, name, scores[i]))
+            out.append((smiles, name, scores[i], reasons[i]))
         return out
 
     @staticmethod
@@ -265,13 +285,21 @@ class ThompsonSampler:
                         self._disallow_tracker.update(current_list)
                         combos.append(list(current_list))
 
-        # Phase 2: dock the combinations, self.concurrency at a time.
+        # Phase 2: dock the combinations, self.concurrency at a time. Track, per
+        # reagent, how many of its warm-up products failed for a *genuine* reason
+        # (reaction didn't fire / prep / dock) as opposed to being filtered out
+        # on a property/structural alert — filtered pairings must not retire a
+        # reagent (a good building block can have out-of-range random partners).
         warmup_results = []
+        realfail_counts = {}  # (component_idx, reagent_idx) -> count of genuine failures
         for chunk in tqdm(list(self._chunks(combos, self._batch_size())),
                           desc="Warmup", disable=self.hide_progress):
-            for product_smiles, product_name, score in self.evaluate_batch(chunk):
+            for choice_list, (product_smiles, product_name, score, reason) in zip(chunk, self.evaluate_batch(chunk)):
                 if np.isfinite(score):
                     warmup_results.append([score, product_smiles, product_name])
+                elif reason in ("reaction", "fail"):
+                    for comp_i, reagent_j in enumerate(choice_list):
+                        realfail_counts[(comp_i, reagent_j)] = realfail_counts.get((comp_i, reagent_j), 0) + 1
 
         warmup_scores = [ws[0] for ws in warmup_results]
         self.logger.info(
@@ -285,14 +313,28 @@ class ThompsonSampler:
         prior_mean = np.mean(warmup_scores)
         prior_std = np.std(warmup_scores)
         self._warmup_std = prior_std
+        kept_filtered = 0
         for i in range(0, len(self.reagent_lists)):
             for j in range(0, len(self.reagent_lists[i])):
                 reagent = self.reagent_lists[i][j]
                 try:
                     reagent.init_given_prior(prior_mean=prior_mean, prior_std=prior_std)
                 except ValueError:
-                    self.logger.info(f"Skipping reagent {reagent.reagent_name} because there were no successful evaluations during warmup")
-                    self._disallow_tracker.retire_one_synthon(i, j)
+                    # No successful warm-up score for this reagent.
+                    if realfail_counts.get((i, j), 0) == 0:
+                        # Every attempt was merely filtered (or it was never
+                        # sampled) — keep it with the population prior so tight
+                        # filters don't silently eliminate a good building block.
+                        reagent.init_prior_no_obs(prior_mean=prior_mean, prior_std=prior_std)
+                        kept_filtered += 1
+                    else:
+                        # Genuine reaction/prep/dock failures — retire it.
+                        self.logger.info(f"Skipping reagent {reagent.reagent_name} because its warm-up products failed to react or dock")
+                        self._disallow_tracker.retire_one_synthon(i, j)
+        if kept_filtered:
+            self.logger.info(
+                f"Kept {kept_filtered} reagent(s) with the population prior "
+                f"(all warm-up products were filtered, not undockable)")
         self.logger.info(f"Top score found during warmup: {max(warmup_scores):.3f}")
         return warmup_results
 
@@ -343,7 +385,7 @@ class ThompsonSampler:
                     break
             if not selections:
                 break
-            for smiles, name, score in self.evaluate_batch(selections):
+            for smiles, name, score, _reason in self.evaluate_batch(selections):
                 if np.isfinite(score):
                     out_list.append([score, smiles, name])
             done += len(selections)

@@ -88,6 +88,23 @@ class Reagent:
         for score in self.initial_scores:
             self.add_score(score)
 
+    def init_prior_no_obs(self, prior_mean: float, prior_std: float):
+        """
+        Initialize a reagent that collected *no* warm-up score with the population
+        prior only (no replayed observations), and move it into the search phase.
+
+        Used when a reagent's warm-up products were all rejected by the hard
+        property/structural filters (rather than failing to react or dock): such
+        a reagent is not known to be bad, so it stays samplable with a neutral
+        prior instead of being retired.
+        """
+        if self.current_phase != "warmup":
+            raise ValueError(f"Reagent {self.reagent_name} has already been initialized.")
+        self.current_mean = prior_mean
+        self.current_std = prior_std
+        self.known_var = prior_std ** 2
+        self.current_phase = "search"
+
     def _update_mean(self, current_var: float, observed_value: float) -> float:
         """
         Bayesian update to the mean

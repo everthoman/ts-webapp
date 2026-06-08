@@ -362,6 +362,7 @@ class GninaEvaluator(Evaluator):
         self.num_evaluations = 0
         self._dock_count = 0
         self._score_cache: Dict[str, float] = {}
+        self._reason_cache: Dict[str, Optional[str]] = {}  # smiles -> None | "filtered" | "fail"
         self._pose_cache: Dict[str, Tuple[float, Chem.Mol]] = {}  # smiles -> (score, pose mol)
         self.rejections: Dict[str, int] = {}
         self.prep_failures = 0
@@ -374,6 +375,16 @@ class GninaEvaluator(Evaluator):
         return self.num_evaluations
 
     def evaluate(self, mol: Chem.Mol) -> float:
+        return self.evaluate_detailed(mol)[0]
+
+    def evaluate_detailed(self, mol: Chem.Mol) -> Tuple[float, Optional[str]]:
+        """Like :meth:`evaluate` but also returns *why* a score is NaN.
+
+        Reason is ``None`` for a real score, ``"filtered"`` when a hard filter
+        rejected the molecule pre-dock, or ``"fail"`` for a ligand-prep / docking
+        failure. The sampler uses this so that *filtered* warm-up products do not
+        cause an otherwise-good reagent to be retired.
+        """
         if self.cancel_event is not None and self.cancel_event.is_set():
             raise DockingCancelled()
         with self._lock:
@@ -381,12 +392,11 @@ class GninaEvaluator(Evaluator):
         try:
             smiles = Chem.MolToSmiles(mol)
         except Exception:
-            return np.nan
+            return np.nan, "fail"
 
         with self._lock:
-            cached = self._score_cache.get(smiles)
-        if cached is not None:
-            return cached
+            if smiles in self._score_cache:
+                return self._score_cache[smiles], self._reason_cache.get(smiles)
 
         # Hard filters before docking.
         if self.filters is not None and self.filters.active:
@@ -396,21 +406,24 @@ class GninaEvaluator(Evaluator):
                 with self._lock:
                     self.rejections[key] = self.rejections.get(key, 0) + 1
                     self._score_cache[smiles] = np.nan
+                    self._reason_cache[smiles] = "filtered"
                     total_rej = sum(self.rejections.values())
                     snapshot = dict(self.rejections)
                 if self.progress_callback is not None and total_rej % 100 == 0:
                     self.progress_callback(
                         f"filtered {total_rej} products so far (pre-dock) {snapshot}"
                     )
-                return np.nan
+                return np.nan, "filtered"
 
         # Docking (the slow part) runs without the lock held so parallel docks
         # actually overlap; only the bookkeeping around it is serialised.
         score = self._dock(smiles)
+        result_reason = None if np.isfinite(score) else "fail"
         with self._lock:
             self._score_cache[smiles] = score
+            self._reason_cache[smiles] = result_reason
         self._emit_progress(score)
-        return score
+        return score, result_reason
 
     # -- Docking ------------------------------------------------------------
     def _dock(self, smiles: str) -> float:
