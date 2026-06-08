@@ -34,6 +34,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -354,7 +355,10 @@ class GninaEvaluator(Evaluator):
         self.work_dir = input_dict.get("work_dir") or tempfile.mkdtemp(prefix="ts_gnina_")
         os.makedirs(self.work_dir, exist_ok=True)
 
-        # State
+        # State. Guarded by _lock so several docks can run concurrently
+        # (ThompsonSampler.evaluate_batch) without corrupting the counters,
+        # caches or run-directory numbering.
+        self._lock = threading.Lock()
         self.num_evaluations = 0
         self._dock_count = 0
         self._score_cache: Dict[str, float] = {}
@@ -372,13 +376,15 @@ class GninaEvaluator(Evaluator):
     def evaluate(self, mol: Chem.Mol) -> float:
         if self.cancel_event is not None and self.cancel_event.is_set():
             raise DockingCancelled()
-        self.num_evaluations += 1
+        with self._lock:
+            self.num_evaluations += 1
         try:
             smiles = Chem.MolToSmiles(mol)
         except Exception:
             return np.nan
 
-        cached = self._score_cache.get(smiles)
+        with self._lock:
+            cached = self._score_cache.get(smiles)
         if cached is not None:
             return cached
 
@@ -387,17 +393,22 @@ class GninaEvaluator(Evaluator):
             reason = self.filters.reject_reason(mol)
             if reason is not None:
                 key = reason.split(":")[0].split(" ")[0]
-                self.rejections[key] = self.rejections.get(key, 0) + 1
-                self._score_cache[smiles] = np.nan
-                total_rej = sum(self.rejections.values())
+                with self._lock:
+                    self.rejections[key] = self.rejections.get(key, 0) + 1
+                    self._score_cache[smiles] = np.nan
+                    total_rej = sum(self.rejections.values())
+                    snapshot = dict(self.rejections)
                 if self.progress_callback is not None and total_rej % 100 == 0:
                     self.progress_callback(
-                        f"filtered {total_rej} products so far (pre-dock) {dict(self.rejections)}"
+                        f"filtered {total_rej} products so far (pre-dock) {snapshot}"
                     )
                 return np.nan
 
+        # Docking (the slow part) runs without the lock held so parallel docks
+        # actually overlap; only the bookkeeping around it is serialised.
         score = self._dock(smiles)
-        self._score_cache[smiles] = score
+        with self._lock:
+            self._score_cache[smiles] = score
         self._emit_progress(score)
         return score
 
@@ -405,11 +416,14 @@ class GninaEvaluator(Evaluator):
     def _dock(self, smiles: str) -> float:
         sdf_block, err = prepare_ligand_3d(smiles, self.ph, "ligand")
         if sdf_block is None:
-            self.prep_failures += 1
+            with self._lock:
+                self.prep_failures += 1
             return np.nan
 
-        self._dock_count += 1
-        run_dir = os.path.join(self.work_dir, f"dock_{self._dock_count:06d}")
+        with self._lock:
+            self._dock_count += 1
+            dock_id = self._dock_count
+        run_dir = os.path.join(self.work_dir, f"dock_{dock_id:06d}")
         os.makedirs(run_dir, exist_ok=True)
         lig_path = os.path.join(run_dir, "ligand.sdf")
         out_path = os.path.join(run_dir, "docked.sdf")
@@ -449,18 +463,21 @@ class GninaEvaluator(Evaluator):
                 cmd, capture_output=True, text=True, env=env, timeout=self.timeout
             )
         except subprocess.TimeoutExpired:
-            self.dock_failures += 1
+            with self._lock:
+                self.dock_failures += 1
             shutil.rmtree(run_dir, ignore_errors=True)
             return np.nan
 
         if proc.returncode != 0 or not os.path.isfile(out_path):
-            self.dock_failures += 1
+            with self._lock:
+                self.dock_failures += 1
             shutil.rmtree(run_dir, ignore_errors=True)
             return np.nan
 
         score, pose_mol = self._best_pose(out_path, smiles)
         if pose_mol is not None:
-            self._pose_cache[smiles] = (score, pose_mol)
+            with self._lock:
+                self._pose_cache[smiles] = (score, pose_mol)
         shutil.rmtree(run_dir, ignore_errors=True)
         return score if score is not None else np.nan
 
@@ -496,20 +513,22 @@ class GninaEvaluator(Evaluator):
 
     # -- Progress + output --------------------------------------------------
     def _emit_progress(self, score: float) -> None:
-        if np.isfinite(score):
-            if self._best_score is None or (
-                score > self._best_score if self.higher_is_better else score < self._best_score
-            ):
-                self._best_score = score
-        if self.progress_callback is None:
-            return
-        if self._dock_count % self.progress_every == 0:
+        with self._lock:
+            if np.isfinite(score):
+                if self._best_score is None or (
+                    score > self._best_score if self.higher_is_better else score < self._best_score
+                ):
+                    self._best_score = score
+            if self.progress_callback is None or self._dock_count % self.progress_every != 0:
+                return
             best = f"{self._best_score:.3f}" if self._best_score is not None else "n/a"
             rej = sum(self.rejections.values())
-            self.progress_callback(
+            msg = (
                 f"docked {self._dock_count} | best {self.score_field}={best} | "
                 f"filtered {rej} | prep_fail {self.prep_failures} | dock_fail {self.dock_failures}"
             )
+        # Call out to the (possibly slow) callback without holding the lock.
+        self.progress_callback(msg)
 
     def stats(self) -> dict:
         return {

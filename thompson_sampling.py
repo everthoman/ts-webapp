@@ -1,4 +1,5 @@
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Tuple
 
 import functools
@@ -31,6 +32,9 @@ class ThompsonSampler:
         self.logger = get_logger(__name__, filename=log_filename)
         self._disallow_tracker = None
         self.hide_progress = False
+        # Number of products to score in parallel. 1 == the original sequential
+        # behaviour. The evaluator must be thread-safe (GninaEvaluator is).
+        self.concurrency = 1
         self._mode = mode
         if self._mode == "maximize":
             self.pick_function = np.nanargmax
@@ -75,6 +79,18 @@ class ThompsonSampler:
         """
         self.hide_progress = hide_progress
 
+    def set_concurrency(self, concurrency: int) -> None:
+        """
+        Number of products to build + dock in parallel (>=1).
+
+        Docking is the rate-limiting step and each dock is independent, so the
+        warm-up and search phases dock a batch of ``concurrency`` molecules at
+        once. Scores are still recorded into the reagents single-threaded after
+        each batch, so the Thompson Sampling bookkeeping is unchanged; only the
+        wall-clock time drops. Requires a thread-safe evaluator.
+        """
+        self.concurrency = max(1, int(concurrency))
+
     def read_reagents(self, reagent_file_list, num_to_select: Optional[int] = None):
         """
         Reads the reagents from reagent_file_list
@@ -108,31 +124,97 @@ class ThompsonSampler:
         """
         self.reaction = AllChem.ReactionFromSmarts(rxn_smarts)
 
+    def _build_product(self, choice_list: List[int]):
+        """Build the product molecule for a set of reagent choices.
+
+        :return: ``(product_mol_or_None, smiles, product_name, selected_reagents)``.
+            ``product_mol`` is ``None`` (and smiles ``"FAIL"``) when the reaction
+            does not fire or the product cannot be sanitised. Pure / no shared
+            state, so it is safe to call this from worker threads.
+        """
+        selected_reagents = [
+            self.reagent_lists[idx][choice] for idx, choice in enumerate(choice_list)
+        ]
+        product_name = "_".join(r.reagent_name for r in selected_reagents)
+        try:
+            prod = self.reaction.RunReactants([r.mol for r in selected_reagents])
+            if not prod:
+                return None, "FAIL", product_name, selected_reagents
+            prod_mol = prod[0][0]  # RunReactants returns Tuple[Tuple[Mol]]
+            Chem.SanitizeMol(prod_mol)
+            product_smiles = Chem.MolToSmiles(prod_mol)
+        except Exception:
+            return None, "FAIL", product_name, selected_reagents
+        return prod_mol, product_smiles, product_name, selected_reagents
+
+    def _score_product(self, prod_mol, product_name: str) -> float:
+        """Score one product. This is the slow (docking) step run in parallel."""
+        if isinstance(self.evaluator, DBEvaluator):
+            return float(self.evaluator.evaluate(product_name))
+        return self.evaluator.evaluate(prod_mol)
+
+    def _record(self, selected_reagents, score: float) -> None:
+        """Record a finite score against each contributing reagent."""
+        if np.isfinite(score):
+            for reagent in selected_reagents:
+                reagent.add_score(score)
+
     def evaluate(self, choice_list: List[int]) -> Tuple[str, str, float]:
         """Evaluate a set of reagents
         :param choice_list: list of reagent ids
         :return: smiles for the reaction product, score for the reaction product
         """
-        selected_reagents = []
-        for idx, choice in enumerate(choice_list):
-            component_reagent_list = self.reagent_lists[idx]
-            selected_reagents.append(component_reagent_list[choice])
-        prod = self.reaction.RunReactants([reagent.mol for reagent in selected_reagents])
-        product_name = "_".join([reagent.reagent_name for reagent in selected_reagents])
+        prod_mol, product_smiles, product_name, selected_reagents = self._build_product(choice_list)
         res = np.nan
-        product_smiles = "FAIL"
-        if prod:
-            prod_mol = prod[0][0]  # RunReactants returns Tuple[Tuple[Mol]]
-            Chem.SanitizeMol(prod_mol)
-            product_smiles = Chem.MolToSmiles(prod_mol)
-            if isinstance(self.evaluator, DBEvaluator):
-                res = self.evaluator.evaluate(product_name)
-                res = float(res)
-            else:
-                res = self.evaluator.evaluate(prod_mol)
-            if np.isfinite(res):
-                [reagent.add_score(res) for reagent in selected_reagents]
+        if prod_mol is not None:
+            res = self._score_product(prod_mol, product_name)
+            self._record(selected_reagents, res)
         return product_smiles, product_name, res
+
+    def evaluate_batch(self, choice_lists: List[List[int]]) -> List[Tuple[str, str, float]]:
+        """Evaluate several reagent sets, docking up to ``self.concurrency`` at once.
+
+        Products are built (cheap) on the calling thread, docked in parallel,
+        then scores are recorded into the reagents single-threaded so the TS
+        bookkeeping is identical to the sequential path. Returns one
+        ``(smiles, name, score)`` per input, in input order.
+        """
+        built = [self._build_product(cl) for cl in choice_lists]
+        scores: List[float] = [np.nan] * len(built)
+        dock_idx = [i for i, b in enumerate(built) if b[0] is not None]
+
+        if self.concurrency > 1 and len(dock_idx) > 1:
+            pending_exc = None
+            with ThreadPoolExecutor(max_workers=self.concurrency) as ex:
+                futs = {ex.submit(self._score_product, built[i][0], built[i][2]): i for i in dock_idx}
+                for fut in as_completed(futs):
+                    try:
+                        scores[futs[fut]] = fut.result()
+                    except Exception as e:  # e.g. DockingCancelled
+                        pending_exc = e
+                        for f in futs:
+                            f.cancel()  # drop not-yet-started docks
+                        break
+            if pending_exc is not None:
+                raise pending_exc
+        else:
+            for i in dock_idx:
+                scores[i] = self._score_product(built[i][0], built[i][2])
+
+        out = []
+        for i, (_pm, smiles, name, selected_reagents) in enumerate(built):
+            self._record(selected_reagents, scores[i])
+            out.append((smiles, name, scores[i]))
+        return out
+
+    @staticmethod
+    def _chunks(seq, n):
+        for i in range(0, len(seq), n):
+            yield seq[i:i + n]
+
+    def _batch_size(self) -> int:
+        """How many products to build per chunk (bounds peak memory)."""
+        return self.concurrency * 8 if self.concurrency > 1 else 1
 
     def warm_up(self, num_warmup_trials=3):
         """Warm-up phase, each reagent is sampled with num_warmup_trials random partners
@@ -142,13 +224,18 @@ class ThompsonSampler:
         idx_list = list(range(0, len(self.reagent_lists)))
         # get the number of reagents for each component in the reaction
         reagent_count_list = [len(x) for x in self.reagent_lists]
-        warmup_results = []
+
+        # Phase 1: enumerate every warm-up reagent combination. The disallow
+        # tracking and random partner selection are cheap CPU work and stay
+        # sequential (and deterministic w.r.t. the RNG) — only docking, in
+        # phase 2, is parallelised.
+        combos: List[List[int]] = []
         for i in idx_list:
             partner_list = [x for x in idx_list if x != i]
             # The number of reagents for this component
             current_max = reagent_count_list[i]
             # For each reagent...
-            for j in tqdm(range(0, current_max), desc=f"Warmup {i + 1} of {len(idx_list)}", disable=self.hide_progress):
+            for j in range(0, current_max):
                 # For each warmup trial...
                 for k in range(0, num_warmup_trials):
                     current_list = [DisallowTracker.Empty] * len(idx_list)
@@ -169,9 +256,15 @@ class ThompsonSampler:
                             # and select a random one
                             current_list[p] = np.nanargmax(selection_scores).item(0)
                         self._disallow_tracker.update(current_list)
-                        product_smiles, product_name, score = self.evaluate(current_list)
-                        if np.isfinite(score):
-                            warmup_results.append([score, product_smiles, product_name])
+                        combos.append(list(current_list))
+
+        # Phase 2: dock the combinations, self.concurrency at a time.
+        warmup_results = []
+        for chunk in tqdm(list(self._chunks(combos, self._batch_size())),
+                          desc="Warmup", disable=self.hide_progress):
+            for product_smiles, product_name, score in self.evaluate_batch(chunk):
+                if np.isfinite(score):
+                    warmup_results.append([score, product_smiles, product_name])
 
         warmup_scores = [ws[0] for ws in warmup_results]
         self.logger.info(
@@ -196,31 +289,61 @@ class ThompsonSampler:
         self.logger.info(f"Top score found during warmup: {max(warmup_scores):.3f}")
         return warmup_results
 
+    def _sample_one(self, rng) -> List[int]:
+        """Draw one reagent selection from the current TS posteriors.
+
+        Raises ``ValueError`` (from the nanargmax/min pick) once the disallow
+        tracker has exhausted the library, which the caller treats as "stop".
+        """
+        selected_reagents = [DisallowTracker.Empty] * len(self.reagent_lists)
+        for cycle_id in random.sample(range(0, len(self.reagent_lists)), len(self.reagent_lists)):
+            reagent_list = self.reagent_lists[cycle_id]
+            selected_reagents[cycle_id] = DisallowTracker.To_Fill
+            disallow_mask = self._disallow_tracker.get_disallowed_selection_mask(selected_reagents)
+            stds = np.array([r.current_std for r in reagent_list])
+            mu = np.array([r.current_mean for r in reagent_list])
+            choice_row = rng.normal(size=len(reagent_list)) * stds + mu
+            if disallow_mask:
+                choice_row[np.array(list(disallow_mask))] = np.nan
+            selected_reagents[cycle_id] = self.pick_function(choice_row)
+        self._disallow_tracker.update(selected_reagents)
+        return selected_reagents
+
     def search(self, num_cycles=25):
         """Run the search
         :param: num_cycles: number of search iterations
         :return: a list of SMILES and scores
+
+        Iterations are processed in batches of ``self.concurrency`` so docking
+        runs in parallel. Within a batch the selections are drawn from the same
+        (not-yet-updated) posteriors — the standard batched Thompson Sampling
+        trade-off — which is exact when concurrency == 1.
         """
         out_list = []
         rng = np.random.default_rng()
-        for i in tqdm(range(0, num_cycles), desc="Cycle", disable=self.hide_progress):
-            selected_reagents = [DisallowTracker.Empty] * len(self.reagent_lists)
-            for cycle_id in random.sample(range(0, len(self.reagent_lists)), len(self.reagent_lists)):
-                reagent_list = self.reagent_lists[cycle_id]
-                selected_reagents[cycle_id] = DisallowTracker.To_Fill
-                disallow_mask = self._disallow_tracker.get_disallowed_selection_mask(selected_reagents)
-                stds = np.array([r.current_std for r in reagent_list])
-                mu = np.array([r.current_mean for r in reagent_list])
-                choice_row = rng.normal(size=len(reagent_list)) * stds + mu
-                if disallow_mask:
-                    choice_row[np.array(list(disallow_mask))] = np.nan
-                selected_reagents[cycle_id] = self.pick_function(choice_row)
-            self._disallow_tracker.update(selected_reagents)
-            # Select a reagent for each component, according to the choice function
-            smiles, name, score = self.evaluate(selected_reagents)
-            if np.isfinite(score):
-                out_list.append([score, smiles, name])
-            if i % 100 == 0:
+        batch_size = max(1, self.concurrency)
+        done = 0
+        last_log = 0
+        exhausted = False
+        pbar = tqdm(total=num_cycles, desc="Cycle", disable=self.hide_progress)
+        while done < num_cycles and not exhausted:
+            selections = []
+            for _ in range(min(batch_size, num_cycles - done)):
+                try:
+                    selections.append(self._sample_one(rng))
+                except ValueError:
+                    exhausted = True
+                    break
+            if not selections:
+                break
+            for smiles, name, score in self.evaluate_batch(selections):
+                if np.isfinite(score):
+                    out_list.append([score, smiles, name])
+            done += len(selections)
+            pbar.update(len(selections))
+            if out_list and done - last_log >= 100:
                 top_score, top_smiles, top_name = self._top_func(out_list)
-                self.logger.info(f"Iteration: {i} max score: {top_score:2f} smiles: {top_smiles} {top_name}")
+                self.logger.info(f"Iteration: {done} max score: {top_score:2f} smiles: {top_smiles} {top_name}")
+                last_log = done
+        pbar.close()
         return out_list

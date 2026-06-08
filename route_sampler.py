@@ -25,12 +25,10 @@ original single-reaction behaviour.
 
 from typing import List, Tuple
 
-import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
 from thompson_sampling import ThompsonSampler
-from evaluators import DBEvaluator
 
 
 class RouteSampler(ThompsonSampler):
@@ -61,21 +59,24 @@ class RouteSampler(ThompsonSampler):
     def _expected_reagent_count(self) -> int:
         return sum(n for _rxn, n in self.route_steps)
 
-    def evaluate(self, choice_list: List[int]) -> Tuple[str, str, float]:
+    def _build_product(self, choice_list: List[int]):
         """
-        Build the final product by running the reaction sequence, then score it.
+        Build the final product by running the reaction sequence.
+
+        Overrides the single-reaction base method so that all of the base
+        sampler's machinery (sequential ``evaluate`` and parallel
+        ``evaluate_batch``, warm-up and search) drives the multi-step route
+        unchanged. Pure / no shared state, so it is safe to call from worker
+        threads.
 
         :param choice_list: list of reagent indices, one per reagent component,
             ordered to match the flat ``reagent_lists`` (route order).
-        :return: (final_product_smiles, product_name, score)
+        :return: ``(product_mol_or_None, smiles, product_name, selected_reagents)``.
         """
         selected_reagents = [
             self.reagent_lists[idx][choice] for idx, choice in enumerate(choice_list)
         ]
         product_name = "_".join(r.reagent_name for r in selected_reagents)
-
-        res = np.nan
-        product_smiles = "FAIL"
         try:
             cursor = 0
             intermediate = None
@@ -88,21 +89,11 @@ class RouteSampler(ThompsonSampler):
                     cursor += 1
                 products = rxn.RunReactants(reactants)
                 if not products:
-                    return product_smiles, product_name, res
+                    return None, "FAIL", product_name, selected_reagents
                 intermediate = products[0][0]  # Tuple[Tuple[Mol]]
                 Chem.SanitizeMol(intermediate)
-            prod_mol = intermediate
-            product_smiles = Chem.MolToSmiles(prod_mol)
+            product_smiles = Chem.MolToSmiles(intermediate)
         except Exception:
             # Any RDKit failure in the route -> treat as a failed product (NaN).
-            return "FAIL", product_name, np.nan
-
-        if isinstance(self.evaluator, DBEvaluator):
-            res = float(self.evaluator.evaluate(product_name))
-        else:
-            res = self.evaluator.evaluate(prod_mol)
-
-        if np.isfinite(res):
-            for reagent in selected_reagents:
-                reagent.add_score(res)
-        return product_smiles, product_name, res
+            return None, "FAIL", product_name, selected_reagents
+        return intermediate, product_smiles, product_name, selected_reagents

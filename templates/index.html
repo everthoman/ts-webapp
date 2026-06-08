@@ -132,6 +132,9 @@
         <div><label>Search iterations</label><input type="number" id="iters" value="100" min="1"></div>
         <div><label>GPU id <span class="chip">(CNN modes only)</span></label><input type="number" id="gpu" value="0" min="0"></div>
       </div>
+      <div class="grid3">
+        <div><label>Parallel docks <span class="chip">(blank = max throughput)</span></label><input type="number" id="concurrency" placeholder="auto" min="1"></div>
+      </div>
       <div class="note" id="costNote"></div>
     </div>
 
@@ -272,7 +275,11 @@ function buildConfig(){
       mw: [numOrNull(mwLo), numOrNull(mwHi)],
       logp: [numOrNull(logpLo), numOrNull(logpHi)],
     },
-    ts: { num_warmup_trials: parseInt(warmup.value), num_ts_iterations: parseInt(iters.value) },
+    ts: {
+      num_warmup_trials: parseInt(warmup.value),
+      num_ts_iterations: parseInt(iters.value),
+      concurrency: concurrency.value==='' ? null : parseInt(concurrency.value),
+    },
     gpu_id: parseInt(gpu.value),
   };
 }
@@ -314,12 +321,14 @@ document.getElementById('runBtn').addEventListener('click', async ()=>{
     setStatus(e.data);
     document.getElementById('runBtn').disabled=false;
     document.getElementById('cancelBtn').disabled=true;
+    const logLink = `<a class="dl" href="/jobs/${job_id}/download/run.log">⬇ run.log</a>`;
     if (e.data==='done'){
       document.getElementById('downloads').innerHTML =
         `<a class="dl" href="/jobs/${job_id}/download/results.csv">⬇ results.csv</a>` +
-        `<a class="dl" href="/jobs/${job_id}/download/poses.sdf">⬇ poses.sdf</a>`;
+        `<a class="dl" href="/jobs/${job_id}/download/poses.sdf">⬇ poses.sdf</a>` +
+        logLink;
     } else {
-      document.getElementById('downloads').innerHTML = `Run ${e.data}.`;
+      document.getElementById('downloads').innerHTML = `Run ${e.data}. ` + logLink;
     }
   });
   ev.onerror = ()=>{ /* keep retrying until end event */ };

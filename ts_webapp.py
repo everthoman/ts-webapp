@@ -32,7 +32,7 @@ import pandas as pd
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 
-from gnina_evaluator import GninaEvaluator, MolFilters, DockingCancelled, GNINA_PATH
+from gnina_evaluator import GninaEvaluator, MolFilters, DockingCancelled, GNINA_PATH, DOCK_CPU
 from route_sampler import RouteSampler
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -67,10 +67,27 @@ class Job:
     evaluator: Optional[GninaEvaluator] = None
     n_results: int = 0
     started: float = field(default_factory=time.time)
+    _log_lock: threading.Lock = field(default_factory=threading.Lock)
+
+    @property
+    def log_path(self) -> Path:
+        return self.dir / "run.log"
+
+    def _append(self, line: str) -> None:
+        """Append a console line to the in-memory buffer and the run.log file.
+
+        Thread-safe: progress callbacks fire from parallel docking threads.
+        """
+        with self._log_lock:
+            self.lines.append(line)
+            try:
+                with open(self.log_path, "a") as fh:
+                    fh.write(line + "\n")
+            except Exception:
+                pass
 
     def log(self, msg: str) -> None:
-        stamp = time.strftime("%H:%M:%S")
-        self.lines.append(f"[{stamp}] {msg}")
+        self._append(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
 
 JOBS: Dict[str, Job] = {}
@@ -85,7 +102,7 @@ class _JobLogHandler(logging.Handler):
 
     def emit(self, record):
         try:
-            self.job.lines.append(f"[{time.strftime('%H:%M:%S')}] {record.getMessage()}")
+            self.job._append(f"[{time.strftime('%H:%M:%S')}] {record.getMessage()}")
         except Exception:
             pass
 
@@ -179,15 +196,32 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
                 f"MW {filters.mw_range}, logP {filters.logp_range})"
             )
 
+            # Concurrency: dock several molecules at once, splitting the CPU
+            # budget across them. gnina parallelises only ~exhaustiveness ways,
+            # so the throughput-maximising default runs DOCK_CPU // exhaustiveness
+            # docks in parallel at exhaustiveness CPUs each (full machine, no
+            # wasted cores). Override via the "concurrency" config field or the
+            # TS_CONCURRENCY env var.
+            exhaustiveness = int(gnina.get("exhaustiveness", 8))
+            default_conc = max(1, DOCK_CPU // max(1, exhaustiveness))
+            req_conc = ts.get("concurrency") or os.environ.get("TS_CONCURRENCY")
+            concurrency = default_conc if not req_conc else max(1, int(req_conc))
+            cpu_per_dock = max(1, DOCK_CPU // concurrency)
+            job.log(
+                f"Concurrency: {concurrency} parallel dock(s) x {cpu_per_dock} CPU each "
+                f"(budget {DOCK_CPU} CPU, exhaustiveness {exhaustiveness})"
+            )
+
             eval_dict = {
                 "receptor_path": str(job.dir / "receptor.pdb"),
                 "score_field": gnina["score_field"],
                 "cnn_scoring": gnina.get("cnn_scoring", "none"),
-                "exhaustiveness": gnina.get("exhaustiveness", 8),
+                "exhaustiveness": exhaustiveness,
                 "num_modes": gnina.get("num_modes", 9),
                 "autobox_add": gnina.get("autobox_add", 4.0),
                 "ph": gnina.get("ph", 7.4),
                 "gpu_id": cfg.get("gpu_id", 0),
+                "cpu": cpu_per_dock,
                 "work_dir": str(job.dir / "dock"),
                 "filters": filters,
                 "cancel_event": job.cancel_event,
@@ -205,6 +239,7 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
 
             sampler = RouteSampler(mode=mode)
             sampler.set_hide_progress(True)
+            sampler.set_concurrency(concurrency)
             sampler.set_evaluator(evaluator)
             sampler.read_reagents(reagent_file_list=reagent_file_list, num_to_select=None)
             sampler.set_route(route_steps)
@@ -387,7 +422,7 @@ async def download(job_id: str, name: str):
     job = JOBS.get(job_id)
     if job is None:
         raise HTTPException(404, "Unknown job")
-    if name not in ("results.csv", "poses.sdf"):
+    if name not in ("results.csv", "poses.sdf", "run.log"):
         raise HTTPException(400, "Invalid file")
     path = job.dir / name
     if not path.is_file():
