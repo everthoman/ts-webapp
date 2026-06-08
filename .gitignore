@@ -163,3 +163,5 @@ cython_debug/
 jobs/
 ts_webapp.out
 ts_webapp.log
+# Prepared-receptor bundles (binary, redundant with the unpacked .pdb/.sdf)
+data/*.zip
