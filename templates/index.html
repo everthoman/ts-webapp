@@ -48,14 +48,11 @@
   .card .score { font-weight:700; }
   .card .name { color:#555; word-break:break-all; }
   .card .smi { color:#999; word-break:break-all; font-family: ui-monospace, Menlo, monospace; }
-  #jobList { max-height:320px; overflow:auto; }
-  .jobtoggle { text-align:center; font-size:12px; color:var(--accent); cursor:pointer; padding:4px; }
-  .jobrow { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:7px 8px; border:1px solid #2f3a57; border-radius:7px; margin-bottom:6px; background:#131a29; }
-  .jobrow.sel { border-color:var(--accent); }
-  .jobrow button.del { background:#3a2330; color:var(--err); }
-  .jobrow .jmain { min-width:0; } .jobrow b { font-size:13px; } .jobrow .sub { font-size:11px; color:var(--muted); }
-  .jobrow .jbtns { flex:0 0 auto; display:flex; gap:6px; }
-  .jobrow button { padding:4px 9px; font-size:12px; }
+  .jobbar { display:flex; gap:8px; align-items:center; }
+  .jobbar select { flex:1; min-width:0; }
+  .jobbar button { flex:0 0 auto; padding:6px 11px; font-size:12px; }
+  .jobbar button.del { background:#3a2330; color:var(--err); }
+  .sub { font-size:11.5px; color:var(--muted); }
   .report { font-size:12.5px; line-height:1.6; background:#0d121d; border:1px solid #2f3a57; border-radius:8px; padding:10px 12px; margin-top:10px; }
   .report .big { font-size:15px; font-weight:700; } .report .warnote { color:var(--warn); } .report .oknote { color:var(--ok); }
 </style>
@@ -174,8 +171,15 @@
   <!-- RIGHT: progress -->
   <div>
     <div class="panel">
-      <h2>Past runs <button class="btn ghost" id="refreshJobs" type="button" style="float:right;padding:3px 10px">refresh</button></h2>
-      <div id="jobList" class="muted">No runs yet.</div>
+      <h2>Past runs</h2>
+      <div class="jobbar">
+        <select id="jobSelect"><option value="">No runs yet</option></select>
+        <button class="btn ghost" id="jobView" type="button">view</button>
+        <button class="btn ghost" id="jobRerun" type="button">rerun</button>
+        <button class="del" id="jobDelete" type="button" title="delete">✕</button>
+        <button class="btn ghost" id="refreshJobs" type="button" title="refresh">↻</button>
+      </div>
+      <div id="jobInfo" class="sub" style="margin-top:7px"></div>
     </div>
 
     <div class="panel">
@@ -449,41 +453,48 @@ async function runPreflight(){
 }
 document.getElementById('preflightBtn').addEventListener('click', runPreflight);
 
-// ---- Job history ----
-let showAllJobs = false;
-const JOBS_SHOWN = 8;
-function jobPill(s){ return `<span class="pill status-${s}">${s}</span>`; }
+// ---- Job history (dropdown) ----
+let jobsById = {};
+const jobSelect = document.getElementById('jobSelect');
+const jobInfo = document.getElementById('jobInfo');
+function selectedJob(){ return jobsById[jobSelect.value] || null; }
+function jobSummary(j){
+  if (!j) return '';
+  return [
+    j.status,
+    j.n_results!=null ? `${j.n_results} hits` : null,
+    j.top ? `best ${(+j.top.score).toFixed(2)}` : null,
+    j.seed!=null ? `seed ${j.seed}` : null,
+    j.started || null,
+  ].filter(Boolean).join(' · ');
+}
+function updateJobControls(){
+  const j = selectedJob();
+  jobInfo.textContent = jobSummary(j);
+  document.getElementById('jobView').disabled = !j;
+  document.getElementById('jobDelete').disabled = !j;
+  document.getElementById('jobRerun').disabled = !(j && j.can_rerun);
+}
 async function refreshJobs(){
   let data;
   try { data = await (await fetch('/jobs')).json(); } catch(e){ return; }
-  const jl = document.getElementById('jobList');
-  if (!data.jobs.length){ jl.innerHTML = '<span class="muted">No runs yet.</span>'; return; }
-  const all = data.jobs;
-  const shown = showAllJobs ? all : all.slice(0, JOBS_SHOWN);
-  const rows = shown.map(j=>{
-    const sub = [
-      j.n_results!=null ? `${j.n_results} hits` : null,
-      j.top ? `best ${(+j.top.score).toFixed(2)}` : null,
-      j.seed!=null ? `seed ${j.seed}` : null,
-      j.started || null,
-    ].filter(Boolean).join(' · ');
-    const rerunBtn = j.can_rerun ? `<button class="btn ghost" data-act="rerun" data-id="${esc(j.id)}">rerun</button>` : '';
-    const sel = j.id===currentJob ? ' sel' : '';
-    return `<div class="jobrow${sel}"><div class="jmain">
-        ${jobPill(j.status)} <b>${esc(j.id)}</b>
-        <div class="sub">${esc(sub)}</div>
-      </div><div class="jbtns">
-        <button class="btn ghost" data-act="view" data-id="${esc(j.id)}" data-status="${j.status}">view</button>
-        ${rerunBtn}
-        <button class="del" data-act="del" data-id="${esc(j.id)}" title="delete">✕</button>
-      </div></div>`;
+  jobsById = {};
+  const keep = jobSelect.value;
+  if (!data.jobs.length){
+    jobSelect.innerHTML = '<option value="">No runs yet</option>';
+    updateJobControls(); return;
+  }
+  jobSelect.innerHTML = data.jobs.map(j=>{
+    jobsById[j.id] = j;
+    const n = j.n_results!=null ? ` · ${j.n_results} hits` : '';
+    return `<option value="${esc(j.id)}">${esc(j.id)} — ${j.status}${n}</option>`;
   }).join('');
-  const toggle = all.length > JOBS_SHOWN
-    ? `<div class="jobtoggle" data-act="toggle">${showAllJobs ? 'show less' : `show all (${all.length})`}</div>`
-    : '';
-  jl.innerHTML = rows + toggle;
+  if (jobsById[keep]) jobSelect.value = keep;
+  else if (jobsById[currentJob]) jobSelect.value = currentJob;
+  updateJobControls();
 }
 async function deleteJob(id){
+  if (!id) return;
   if (!confirm(`Delete run "${id}"? This removes its results from disk.`)) return;
   try {
     const r = await fetch(`/jobs/${id}`, {method:'DELETE'});
@@ -516,14 +527,10 @@ async function rerunJob(id){
   const {job_id} = await res.json();
   attachStream(job_id); refreshJobs();
 }
-document.getElementById('jobList').addEventListener('click', e=>{
-  const t = e.target.closest('[data-act]'); if(!t) return;
-  const act = t.dataset.act;
-  if (act==='view') viewJob(t.dataset.id, t.dataset.status);
-  else if (act==='rerun') rerunJob(t.dataset.id);
-  else if (act==='del') deleteJob(t.dataset.id);
-  else if (act==='toggle'){ showAllJobs = !showAllJobs; refreshJobs(); }
-});
+jobSelect.addEventListener('change', updateJobControls);
+document.getElementById('jobView').addEventListener('click', ()=>{ const j=selectedJob(); if(j) viewJob(j.id, j.status); });
+document.getElementById('jobRerun').addEventListener('click', ()=>{ const j=selectedJob(); if(j&&j.can_rerun) rerunJob(j.id); });
+document.getElementById('jobDelete').addEventListener('click', ()=>{ const j=selectedJob(); if(j) deleteJob(j.id); });
 document.getElementById('refreshJobs').addEventListener('click', refreshJobs);
 refreshJobs();
 </script>
