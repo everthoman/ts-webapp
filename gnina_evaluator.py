@@ -364,6 +364,7 @@ class GninaEvaluator(Evaluator):
         self._score_cache: Dict[str, float] = {}
         self._reason_cache: Dict[str, Optional[str]] = {}  # smiles -> None | "filtered" | "fail"
         self._pose_cache: Dict[str, Tuple[float, Chem.Mol]] = {}  # smiles -> (score, pose mol)
+        self._name_cache: Dict[str, str] = {}  # smiles -> reagent-combo name (for the live gallery)
         self.rejections: Dict[str, int] = {}
         self.prep_failures = 0
         self.dock_failures = 0
@@ -393,6 +394,12 @@ class GninaEvaluator(Evaluator):
             smiles = Chem.MolToSmiles(mol)
         except Exception:
             return np.nan, "fail"
+
+        # The sampler stamps the reagent-combo name onto the mol; capture it so
+        # the live gallery can label products before results.csv is written.
+        if mol.HasProp("_Name"):
+            with self._lock:
+                self._name_cache.setdefault(smiles, mol.GetProp("_Name"))
 
         with self._lock:
             if smiles in self._score_cache:
@@ -542,6 +549,18 @@ class GninaEvaluator(Evaluator):
             )
         # Call out to the (possibly slow) callback without holding the lock.
         self.progress_callback(msg)
+
+    def top_scored(self, n: int = 12) -> List[Tuple[float, str, str]]:
+        """Current best ``(score, smiles, name)`` rows, best-first.
+
+        Drawn live from the score cache (keyed by SMILES, so already deduped to
+        the best per molecule) under the lock, so the gallery can update while a
+        run is still in progress. Ordering matches the final results.csv."""
+        with self._lock:
+            rows = [(s, smi, self._name_cache.get(smi, smi))
+                    for smi, s in self._score_cache.items() if np.isfinite(s)]
+        rows.sort(key=lambda r: r[0], reverse=self.higher_is_better)
+        return rows[: max(1, int(n))]
 
     def stats(self) -> dict:
         return {

@@ -145,13 +145,25 @@
     <div class="panel">
       <h2>5 &middot; Thompson Sampling</h2>
       <div class="grid3">
+        <div><label>Search method</label>
+          <select id="method">
+            <option value="ts">Thompson Sampling (argmax)</option>
+            <option value="rws">Roulette Wheel + thermal cycling (RWS)</option>
+          </select></div>
         <div><label>Warm-up trials / reagent</label><input type="number" id="warmup" value="2" min="1"></div>
-        <div><label>Search iterations</label><input type="number" id="iters" value="100" min="1"></div>
-        <div><label>GPU id <span class="chip">(CNN modes only)</span></label><input type="number" id="gpu" value="0" min="0"></div>
+        <div><label>Search budget <span class="chip">(products to dock)</span></label><input type="number" id="iters" value="100" min="1"></div>
+      </div>
+      <div class="grid3" id="rwsParams" style="display:none">
+        <div><label>Min compounds / core <span class="chip">(RWS batch size)</span></label><input type="number" id="rwsMinCore" value="50" min="1"></div>
+        <div><label>Resample stop <span class="chip">(RWS: consecutive dups)</span></label><input type="number" id="rwsStop" value="6000" min="1"></div>
+        <div></div>
       </div>
       <div class="grid3">
+        <div><label>GPU id <span class="chip">(CNN modes only)</span></label><input type="number" id="gpu" value="0" min="0"></div>
         <div><label>Parallel docks <span class="chip">(blank = max throughput)</span></label><input type="number" id="concurrency" placeholder="auto" min="1"></div>
         <div><label>Random seed <span class="chip">(blank = random)</span></label><input type="number" id="seed" placeholder="random" min="0"></div>
+      </div>
+      <div class="grid3">
         <div><label>Session name <span class="chip">(rerun overwrites)</span></label><input type="text" id="sessionName" placeholder="e.g. 7Z5B_amide"></div>
       </div>
       <div class="note" id="costNote"></div>
@@ -159,8 +171,8 @@
 
     <div class="panel">
       <div class="row">
-        <button class="btn" id="runBtn" type="button">Run search</button>
         <button class="btn ghost" id="preflightBtn" type="button">Check filters</button>
+        <button class="btn" id="runBtn" type="button">Run search</button>
         <button class="btn danger" id="cancelBtn" type="button" disabled>Cancel</button>
       </div>
       <div id="preflightReport" class="report" style="display:none"></div>
@@ -235,6 +247,7 @@ function makeStep(idx){
     <select class="reactionSel">
       ${reactions.map(r => `<option value="${r.id}">${r.name}</option>`).join('')}
     </select>
+    ${isFirst ? '' : '<div class="compatNote muted" style="margin-top:6px;font-size:12px"></div>'}
     <div class="reagents"></div>`;
   const rxnSel = div.querySelector('.reactionSel');
   const reagentsDiv = div.querySelector('.reagents');
@@ -246,7 +259,7 @@ function makeStep(idx){
   rxnSel.addEventListener('change', refresh);
   refresh();
   const rm = div.querySelector('.removeStep');
-  if (rm) rm.addEventListener('click', () => { div.remove(); renumber(); updateCost(); });
+  if (rm) rm.addEventListener('click', () => { div.remove(); renumber(); updateCost(); scheduleAnnotate(); });
   return div;
 }
 
@@ -263,6 +276,51 @@ stepsDiv.appendChild(makeStep(0));
 document.getElementById('addStep').addEventListener('click', ()=>{
   if (!extendReactions.length){ alert('No extension reactions defined in reactions.json'); return; }
   stepsDiv.appendChild(makeStep(document.querySelectorAll('#steps .step').length));
+  scheduleAnnotate();
+});
+
+// ---- Reagent-aware extend-reaction compatibility ----
+// Whether an extend reaction chains onto the previous step depends on the chosen
+// upstream reagents (the intermediate carries the next handle only if they're
+// difunctional), so we ask the server to sample real intermediates and annotate
+// each step-2 reaction option with its live "chain rate".
+let annotateTimer = null;
+function scheduleAnnotate(){ clearTimeout(annotateTimer); annotateTimer = setTimeout(annotateAllExtendSteps, 350); }
+
+async function annotateExtendStep(stepDiv, idx){
+  const sel = stepDiv.querySelector('.reactionSel');
+  const note = stepDiv.querySelector('.compatNote');
+  const upstream = collectSteps().slice(0, idx);
+  if (!upstream.length) return;
+  if (note) note.textContent = 'checking which reactions chain onto the previous step…';
+  let data;
+  try {
+    const fd = new FormData(); fd.append('config', JSON.stringify({steps: upstream}));
+    const r = await fetch('/extend-options',{method:'POST',body:fd});
+    if (!r.ok) throw 0;
+    data = await r.json();
+  } catch(e){ if (note) note.textContent=''; return; }
+  if (data.upstream_built === 0){
+    if (note) note.innerHTML = '<span class="warnote">⚠ The previous step built no products from its reagents — fix that before extending.</span>';
+    return;
+  }
+  if (note) note.innerHTML = `<span class="muted">% chain = of ${data.upstream_built} sampled intermediates, how many this reaction can react (default reagent set).</span>`;
+  [...sel.options].forEach(opt=>{
+    const base = CATALOG.reactions.find(x => x.id === opt.value);
+    const info = data.reactions[opt.value];
+    if (!base || !info){ if (base) opt.textContent = base.name; return; }
+    const pct = Math.round(info.chain_rate*100);
+    opt.textContent = `${pct===0 ? '⚠ ' : ''}${base.name} — ${pct}% chain`;
+  });
+}
+
+function annotateAllExtendSteps(){
+  [...document.querySelectorAll('#steps .step')].forEach((s,i)=>{ if (i>0) annotateExtendStep(s,i); });
+}
+
+// Any upstream reaction/reagent change can shift the chain rates downstream.
+stepsDiv.addEventListener('change', e=>{
+  if (e.target.matches('.reactionSel, .reagentSel')){ updateCost(); scheduleAnnotate(); }
 });
 
 document.getElementById('bsMode').addEventListener('change', e=>{
@@ -287,11 +345,16 @@ function updateCost(){
   const warm = parseInt(document.getElementById('warmup').value||'0');
   const iters = parseInt(document.getElementById('iters').value||'0');
   const est = reagentCount()*warm + iters;
+  const label = document.getElementById('method').value === 'rws' ? 'RWS search target' : 'search iterations';
   document.getElementById('costNote').textContent =
-    `≈ up to ${est.toLocaleString()} docking calls (warm-up ${reagentCount()}×${warm} + ${iters} iterations). ` +
+    `≈ up to ${est.toLocaleString()} docking calls (warm-up ${reagentCount()}×${warm} + ${iters} ${label}). ` +
     `Repeated products are cached. Start small — docking dominates runtime.`;
 }
 ['warmup','iters'].forEach(id=>document.getElementById(id).addEventListener('input', updateCost));
+document.getElementById('method').addEventListener('change', e=>{
+  document.getElementById('rwsParams').style.display = e.target.value === 'rws' ? '' : 'none';
+  updateCost();
+});
 updateCost();
 if (!GNINA_OK) document.getElementById('gninaWarn').style.display='block';
 
@@ -321,8 +384,12 @@ function buildConfig(){
       logp: [numOrNull(logpLo), numOrNull(logpHi)],
     },
     ts: {
+      method: document.getElementById('method').value,
       num_warmup_trials: parseInt(warmup.value),
-      num_ts_iterations: parseInt(iters.value),
+      num_ts_iterations: parseInt(iters.value),  // shared search budget (TS cycles / RWS target products)
+      // RWS-only internals
+      min_cpds_per_core: parseInt(document.getElementById('rwsMinCore').value||'50'),
+      stop: parseInt(document.getElementById('rwsStop').value||'6000'),
       concurrency: concurrency.value==='' ? null : parseInt(concurrency.value),
       seed: seed.value==='' ? null : parseInt(seed.value),
     },
@@ -343,12 +410,15 @@ function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt
 async function loadTop(){
   if(!currentJob) return;
   const n = parseInt(topNsel.value);
-  topGrid.innerHTML = '<span class="muted">Loading…</span>';
+  // Only show the placeholder on the first paint; live polling refreshes in
+  // place so the gallery doesn't flicker every tick.
+  if(!topGrid.querySelector('.card')) topGrid.innerHTML = '<span class="muted">Loading…</span>';
   let data;
   try { data = await (await fetch(`/jobs/${currentJob}/top?n=${n}`)).json(); }
-  catch(e){ topGrid.innerHTML = '<span class="muted">Error loading results.</span>'; return; }
-  if(!data.ready || !data.items.length){ topGrid.innerHTML = '<span class="muted">No results yet.</span>'; return; }
-  document.getElementById('topMeta').textContent = `of ${data.total} unique molecules`;
+  catch(e){ if(!topGrid.querySelector('.card')) topGrid.innerHTML = '<span class="muted">Error loading results.</span>'; return; }
+  if(!data.ready || !data.items.length){ if(!topGrid.querySelector('.card')) topGrid.innerHTML = '<span class="muted">No results yet.</span>'; return; }
+  document.getElementById('topMeta').textContent =
+    (data.live ? `live · updating · best ${data.total} so far` : `of ${data.total} unique molecules`);
   topGrid.innerHTML = data.items.map(it => `
     <div class="card">
       ${it.svg || '<div class="muted" style="color:#888">no structure</div>'}
@@ -362,8 +432,19 @@ async function loadTop(){
 document.getElementById('refreshTop').addEventListener('click', loadTop);
 topNsel.addEventListener('change', loadTop);
 
+let liveTopTimer = null;
+function stopLiveTop(){ if(liveTopTimer){ clearInterval(liveTopTimer); liveTopTimer=null; } }
+function startLiveTop(){
+  // Poll the in-progress leaderboard. Docking is slow (seconds/molecule), so an
+  // 8s cadence keeps the gallery current without churning SVG renders.
+  stopLiveTop();
+  topPanel.style.display=''; topGrid.innerHTML='';
+  loadTop();
+  liveTopTimer = setInterval(loadTop, 8000);
+}
+
 function resetRunView(){
-  logEl.innerHTML=''; topPanel.style.display='none'; topGrid.innerHTML='';
+  logEl.innerHTML=''; stopLiveTop(); topPanel.style.display='none'; topGrid.innerHTML='';
   document.getElementById('downloads').innerHTML='Running…';
 }
 function showDownloads(id, status){
@@ -384,10 +465,12 @@ function attachStream(id){
   setStatus('running');
   document.getElementById('runBtn').disabled=true;
   document.getElementById('cancelBtn').disabled=false;
+  startLiveTop();
   const ev = new EventSource(`/jobs/${id}/stream`);
   ev.onmessage = e => addLog(e.data);
   ev.addEventListener('end', e => {
     ev.close();
+    stopLiveTop();
     setStatus(e.data);
     document.getElementById('runBtn').disabled=false;
     document.getElementById('cancelBtn').disabled=true;
@@ -441,15 +524,34 @@ async function runPreflight(){
   const range = o => o ? `${o.p10}–${o.p90} <span class="muted">(full ${o.min}–${o.max})</span>` : 'n/a';
   const rejKeys = Object.keys(data.rejections);
   const rejStr = rejKeys.length ? rejKeys.map(k=>`${k}: ${data.rejections[k]}`).join(', ') : 'none';
+  const buildPct = data.sampled ? Math.round(data.built/data.sampled*100) : 0;
+
+  // No final product could be built at all -> the route, not the filters, is the
+  // problem. Surface that clearly instead of the filter-centric "all pass" note.
+  if (data.built === 0){
+    rep.innerHTML =
+      `<div class="big">0 products built (0/${data.sampled} sampled combinations reacted)</div>` +
+      `<div class="warnote">⚠ The route produced no valid products — the step-2 reaction couldn't be ` +
+      `applied to the step-1 product. This is a reaction-compatibility problem, not a filter problem: ` +
+      `the first step has to leave the functional group the next step needs (e.g. amide→Suzuki fails ` +
+      `because an amide has no aryl halide). Pick chemically compatible steps or difunctional reagents.</div>`;
+    return;
+  }
+
   let note;
-  if (!data.filters_active) note = '<div class="oknote">No filters active — all products pass.</div>';
+  if (!data.filters_active) note = '<div class="oknote">No filters active — all built products pass.</div>';
   else if (pct < 20) note = `<div class="warnote">⚠ Only ${pct}% pass — most rejected by ${esc(rejKeys[0]||'filters')}. Consider widening the window (esp. logP for polar libraries).</div>`;
   else note = `<div class="oknote">✓ ${pct}% pass — looks workable.</div>`;
+  // For multi-step routes a low build rate is expected (the intermediate must be
+  // difunctional), so flag it separately from the filter pass-rate.
+  let buildNote = '';
+  if (buildPct < 50) buildNote = `<div class="warnote">⚠ Only ${buildPct}% of sampled combinations reacted to a final product — the rest failed the route chemistry. Low for a linear route is normal, but very low means few of your reagents chain through both steps.</div>`;
   rep.innerHTML =
     `<div class="big">${data.passed}/${data.built} pass (${pct}%)</div>` +
-    `<div>Rejected — ${esc(rejStr)}${data.reaction_fail?` · reaction-fail ${data.reaction_fail}`:''}</div>` +
+    `<div>Built ${data.built}/${data.sampled} sampled${data.reaction_fail?` · reaction-fail ${data.reaction_fail}`:''}</div>` +
+    `<div>Rejected — ${esc(rejStr)}</div>` +
     `<div>MW p10–p90: ${range(data.mw)}</div>` +
-    `<div>logP p10–p90: ${range(data.logp)}</div>` + note;
+    `<div>logP p10–p90: ${range(data.logp)}</div>` + note + buildNote;
 }
 document.getElementById('preflightBtn').addEventListener('click', runPreflight);
 
@@ -512,6 +614,7 @@ async function loadStaticLog(id){
 }
 async function viewJob(id, status){
   currentJob = id;
+  stopLiveTop();
   if (status==='running' || status==='queued'){ resetRunView(); attachStream(id); return; }
   setStatus(status);
   document.getElementById('cancelBtn').disabled=true;

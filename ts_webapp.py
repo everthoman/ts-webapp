@@ -35,11 +35,12 @@ import pandas as pd
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from rdkit import Chem
-from rdkit.Chem import Crippen, Descriptors
+from rdkit.Chem import AllChem, Crippen, Descriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 
 from gnina_evaluator import GninaEvaluator, MolFilters, DockingCancelled, GNINA_PATH, DOCK_CPU
 from route_sampler import RouteSampler
+from ts_utils import read_reagents
 
 BASE_DIR = Path(__file__).resolve().parent
 JOBS_DIR = BASE_DIR / "jobs"
@@ -323,41 +324,56 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
             job.log(f"{sampler.get_num_prods():.2e} possible final products across the route")
 
             n_warm = int(ts.get("num_warmup_trials", 3))
-            est = sum(len(rl) for rl in sampler.reagent_lists) * n_warm
-            job.log(f"Warm-up: ~{est} docking calls (then {ts.get('num_ts_iterations')} search iterations)")
+            method = (ts.get("method") or "ts").lower()
 
-            try:
-                warmup_results = sampler.warm_up(num_warmup_trials=n_warm)
-            except ValueError:
-                # warm_up() computes np.min/np.mean over the finite warm-up
-                # scores; if every product was filtered out or failed to dock
-                # that array is empty and numpy raises. Turn it into guidance.
+            def _no_warmup_scores() -> RuntimeError:
                 st = evaluator.stats()
-                rej = sum(st["rejections"].values())
-                raise RuntimeError(
+                return RuntimeError(
                     "Warm-up produced no scorable products — nothing to build a prior from. "
-                    f"Of the products tried: {rej} filtered out before docking "
+                    f"Of the products tried: {sum(st['rejections'].values())} filtered out before docking "
                     f"({st['rejections'] or 'none'}), {st['prep_failures']} ligand-prep failures, "
                     f"{st['dock_failures']} docking failures. "
                     "Loosen the MW/logP ranges or PAINS/REOS filters, or check that the "
                     "reaction and receptor/binding site are correct."
                 )
-            if not warmup_results:
-                st = evaluator.stats()
-                raise RuntimeError(
-                    "Warm-up produced no scorable products. "
-                    f"Filtered out: {sum(st['rejections'].values())} {st['rejections'] or ''}; "
-                    f"prep failures: {st['prep_failures']}; dock failures: {st['dock_failures']}. "
-                    "Loosen the filters or check the reaction/receptor."
-                )
-            try:
-                search_results = sampler.search(num_cycles=int(ts.get("num_ts_iterations", 100)))
-            except ValueError as e:
-                # nanargmin/nanargmax raise "All-NaN slice encountered" once the
-                # disallow tracker has exhausted a (typically very small) library.
-                job.log(f"Search ended early — library effectively exhausted ({e}). "
-                        f"Reporting results gathered so far.")
-                search_results = []
+
+            if method == "rws":
+                # Roulette Wheel Sampling + thermal cycling (Zhao et al. 2025).
+                # Budget is an absolute product count, shared with the TS search
+                # field, so a TS vs RWS run on the same budget is comparable.
+                num_targets = int(ts.get("num_ts_iterations", 100))
+                mcpc = int(ts.get("min_cpds_per_core", 50))
+                stop = int(ts.get("stop", 6000))
+                est_warm = sum(len(rl) for rl in sampler.reagent_lists) * n_warm
+                job.log("Selection: Roulette Wheel Sampling + thermal cycling (Zhao 2025)")
+                job.log(f"Warm-up: ~{est_warm} docking calls; then RWS search budget "
+                        f"{num_targets} products (min {mcpc}/core, resample-stop {stop})")
+                warmup_results = sampler.warm_up_rws(num_warmup_trials=n_warm)
+                if not warmup_results:
+                    raise _no_warmup_scores()
+                search_results = sampler.search_rws(
+                    num_targets=num_targets, min_cpds_per_core=mcpc, stop=stop)
+            else:
+                est = sum(len(rl) for rl in sampler.reagent_lists) * n_warm
+                job.log("Selection: standard Thompson Sampling (argmax)")
+                job.log(f"Warm-up: ~{est} docking calls (then {ts.get('num_ts_iterations')} search iterations)")
+                try:
+                    warmup_results = sampler.warm_up(num_warmup_trials=n_warm)
+                except ValueError:
+                    # warm_up() computes np.min/np.mean over the finite warm-up
+                    # scores; if every product was filtered out or failed to dock
+                    # that array is empty and numpy raises. Turn it into guidance.
+                    raise _no_warmup_scores()
+                if not warmup_results:
+                    raise _no_warmup_scores()
+                try:
+                    search_results = sampler.search(num_cycles=int(ts.get("num_ts_iterations", 100)))
+                except ValueError as e:
+                    # nanargmin/nanargmax raise "All-NaN slice encountered" once the
+                    # disallow tracker has exhausted a (typically very small) library.
+                    job.log(f"Search ended early — library effectively exhausted ({e}). "
+                            f"Reporting results gathered so far.")
+                    search_results = []
 
             # Warm-up products are docked too; include them so nothing is lost.
             out_list = warmup_results + search_results
@@ -596,6 +612,67 @@ async def preflight(config: str = Form(...)):
     }
 
 
+@app.post("/extend-options")
+async def extend_options(config: str = Form(...)):
+    """For a prospective extension step, report how often each extend reaction
+    actually chains onto the products of the already-chosen upstream steps.
+
+    Compatibility is reagent-dependent: the upstream product only carries the
+    handle the next reaction needs when the chosen reagents happen to be
+    difunctional. So rather than guess from the reaction templates, we sample
+    real upstream intermediates and try each extend reaction against them, using
+    each reaction's default reagent set. Build-only (no docking), so it's fast
+    enough to drive the step-2 dropdown."""
+    cfg = json.loads(config)
+    upstream = cfg.get("steps", [])
+    if not upstream:
+        raise HTTPException(400, "No upstream steps to extend")
+    reagent_file_list, route_steps, _ = _build_route(upstream)
+    up = RouteSampler(mode="minimize")
+    # Cap reads: a representative sample is plenty and keeps the dropdown snappy.
+    up.read_reagents(reagent_file_list=reagent_file_list, num_to_select=400)
+    up.set_route(route_steps)
+
+    n = 200
+    intermediates = []
+    for _ in range(n):
+        choice = [random.randrange(len(rl)) for rl in up.reagent_lists]
+        mol, _smi, _name, _sel = up._build_product(choice)
+        if mol is not None:
+            intermediates.append(mol)
+
+    results: Dict[str, dict] = {}
+    for r in CATALOG["reactions"]:
+        if r.get("role") != "extend":
+            continue
+        rxn = AllChem.ReactionFromSmarts(r["smarts"])
+        # Default reagent set = first listed for each component. The new reagent
+        # rarely decides whether the reaction fires (its reactive group is fixed
+        # by the set), so this is representative regardless of the final pick.
+        new_lists = [read_reagents([_resolve_set(c["sets"][0])], 300)[0]
+                     for c in r["components"]]
+        built = 0
+        for inter in intermediates:
+            reactants = [inter] + [random.choice(rl).mol for rl in new_lists]
+            try:
+                prods = rxn.RunReactants(reactants)
+                if prods:
+                    Chem.SanitizeMol(prods[0][0])
+                    built += 1
+            except Exception:
+                pass
+        denom = len(intermediates)
+        results[r["id"]] = {
+            "built": built,
+            "chain_rate": round(built / denom, 3) if denom else 0.0,
+        }
+    return {
+        "upstream_built": len(intermediates),
+        "upstream_sampled": n,
+        "reactions": results,
+    }
+
+
 @app.get("/jobs/{job_id}/status")
 async def status(job_id: str):
     job = JOBS.get(job_id)
@@ -653,31 +730,47 @@ def _mol_svg(smiles: str, width: int = 230, height: int = 180) -> str:
     return svg[i:] if i != -1 else svg
 
 
+def _top_items(rows) -> list:
+    """Render ``(score, smiles, name)`` rows (best-first) into gallery items."""
+    items = []
+    for rank, (score, smiles, name) in enumerate(rows, start=1):
+        items.append({
+            "rank": rank,
+            "score": round(float(score), 3),
+            "smiles": str(smiles),
+            "name": str(name),
+            "svg": _mol_svg(str(smiles)),
+        })
+    return items
+
+
 @app.get("/jobs/{job_id}/top")
 async def top(job_id: str, n: int = 12):
-    """Top-N ranked products with structure SVG, score and reagent combination."""
+    """Top-N ranked products with structure SVG, score and reagent combination.
+
+    While a run is in progress the standings are read live from its evaluator;
+    once finished (or for past runs) they come from the persisted results.csv."""
+    n = max(1, min(int(n), 60))
+
+    # Live view: a running job's evaluator holds every score gathered so far.
+    live = JOBS.get(job_id)
+    if live is not None and live.status == "running" and live.evaluator is not None:
+        rows = live.evaluator.top_scored(n)
+        total = live.evaluator.stats()["unique_scored"]
+        return {"ready": bool(rows), "live": True, "items": _top_items(rows), "total": total}
+
     d = _job_dir(job_id)
     if d is None:
         raise HTTPException(404, "Unknown job")
     csv_path = d / "results.csv"
     if not csv_path.is_file():
-        return {"ready": False, "items": []}
+        return {"ready": False, "live": False, "items": []}
     try:
         df = pd.read_csv(csv_path)  # already sorted best-first and deduped
     except Exception:
-        return {"ready": False, "items": []}
-    n = max(1, min(int(n), 60))
-    items = []
-    for rank, row in enumerate(df.head(n).itertuples(index=False), start=1):
-        smiles = str(row.SMILES)
-        items.append({
-            "rank": rank,
-            "score": round(float(row.score), 3),
-            "smiles": smiles,
-            "name": str(row.Name),
-            "svg": _mol_svg(smiles),
-        })
-    return {"ready": True, "items": items, "total": int(len(df))}
+        return {"ready": False, "live": False, "items": []}
+    rows = [(row.score, row.SMILES, row.Name) for row in df.head(n).itertuples(index=False)]
+    return {"ready": True, "live": False, "items": _top_items(rows), "total": int(len(df))}
 
 
 @app.get("/jobs/{job_id}/download/{name}")

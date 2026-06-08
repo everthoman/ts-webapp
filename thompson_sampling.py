@@ -169,6 +169,12 @@ class ThompsonSampler:
         if isinstance(self.evaluator, DBEvaluator):
             score = float(self.evaluator.evaluate(product_name))
             return score, (None if np.isfinite(score) else "fail")
+        # Stamp the reagent-combo name so evaluators can label products (e.g. the
+        # live gallery reads it back); harmless for evaluators that ignore it.
+        try:
+            prod_mol.SetProp("_Name", product_name)
+        except Exception:
+            pass
         detailed = getattr(self.evaluator, "evaluate_detailed", None)
         if detailed is not None:
             return detailed(prod_mol)
@@ -204,6 +210,21 @@ class ThompsonSampler:
         ``"filtered"`` if a hard filter rejected it, or ``"fail"`` for a prep/dock
         failure.
         """
+        results, built = self._score_choice_lists(choice_lists)
+        for (_smiles, _name, score, _reason), (_pm, _smi, _nm, selected_reagents) in zip(results, built):
+            self._record(selected_reagents, score)
+        return results
+
+    def _score_choice_lists(self, choice_lists: List[List[int]]):
+        """Build + dock a batch, ``self.concurrency`` at a time.
+
+        Returns ``(results, built)`` where ``results`` is one
+        ``(smiles, name, score, reason)`` per input (in input order) and
+        ``built`` is the raw ``_build_product`` output (kept so callers can
+        record into reagents). This does *no* posterior bookkeeping itself, so
+        both the standard-TS :meth:`evaluate_batch` and the RWS search can drive
+        the same threaded docking path.
+        """
         built = [self._build_product(cl) for cl in choice_lists]
         scores: List[float] = [np.nan] * len(built)
         # Products that did not build = reaction never fired.
@@ -228,11 +249,8 @@ class ThompsonSampler:
             for i in dock_idx:
                 scores[i], reasons[i] = self._score_product_detailed(built[i][0], built[i][2])
 
-        out = []
-        for i, (_pm, smiles, name, selected_reagents) in enumerate(built):
-            self._record(selected_reagents, scores[i])
-            out.append((smiles, name, scores[i], reasons[i]))
-        return out
+        results = [(built[i][1], built[i][2], scores[i], reasons[i]) for i in range(len(built))]
+        return results, built
 
     @staticmethod
     def _chunks(seq, n):
@@ -395,4 +413,201 @@ class ThompsonSampler:
                 self.logger.info(f"Iteration: {done} max score: {top_score:2f} smiles: {top_smiles} {top_name}")
                 last_log = done
         pbar.close()
+        return out_list
+
+    # -- Roulette Wheel Selection (RWS) -------------------------------------
+    # An alternative to the argmax TS search above, after Zhao et al., "Enhanced
+    # Thompson sampling by roulette wheel selection for screening ultralarge
+    # combinatorial libraries", J. Cheminform. 17:154 (2025), matching the
+    # reference implementation at github.com/PatWalters/TS_2025. Two differences
+    # from plain TS: (1) reagents are drawn by *roulette wheel* on Boltzmann
+    # weights of their sampled scores (not argmax), with a per-component
+    # temperature thermal-cycled to trade greediness for diversity; and (2) the
+    # posterior mean is a Boltzmann-weighted average (Eq. 3), so a strong reagent
+    # is not dragged down by its many weak random partners. RWS matches TS on
+    # 2-component reactions and beats it on 3+-component ones — the multi-step
+    # route case here. Posterior state is kept in the sampler as per-component
+    # arrays so the standard-TS Reagent path is untouched. Scores are handled in
+    # "maximize space" via ``scaling`` (+1 maximize, -1 minimize), matching the
+    # reference.
+
+    def _rws_scaling_factor(self) -> float:
+        return 1.0 if self._mode.startswith("maximize") else -1.0
+
+    def _rws_single_update(self, comb, value: float) -> None:
+        """Boltzmann-weighted posterior update for one scored product (Eq. 3)."""
+        for comp_i, reagent_j in enumerate(comb):
+            prior_var = self._rws_std[comp_i][reagent_j] ** 2
+            denominator = prior_var + self._rws_var_known
+            w = math.exp(value / self._rws_std_known)
+            self._rws_sumw[comp_i][reagent_j] += w
+            sw = self._rws_sumw[comp_i][reagent_j]
+            mu = self._rws_mu[comp_i][reagent_j]
+            self._rws_mu[comp_i][reagent_j] = mu + (w / sw) * (value - mu)
+            self._rws_std[comp_i][reagent_j] = np.sqrt(prior_var * self._rws_var_known / denominator)
+
+    def warm_up_rws(self, num_warmup_trials=5):
+        """RWS warm-up: dock a balanced set of random products (each reagent used
+        >= ``num_warmup_trials`` times), then seed each reagent's Boltzmann-weighted
+        posterior from the population prior plus its own warm-up scores.
+
+        Returns the finite ``[score, smiles, name]`` rows (for the results CSV /
+        gallery); returns ``[]`` if nothing scored so the caller can report it.
+        """
+        scaling = self._rws_scaling_factor()
+        reagent_count_list = [len(x) for x in self.reagent_lists]
+        rmax = max(reagent_count_list)
+
+        # Balanced warm-up matrix: shuffle each component and tile shorter ones up
+        # to rmax, so every reagent is paired at least num_warmup_trials times.
+        pairs: List[List[int]] = []
+        for _ in range(num_warmup_trials):
+            matrix = []
+            for nr in reagent_count_list:
+                idx_r = list(range(nr))
+                random.shuffle(idx_r)
+                if nr < rmax:
+                    matrix.append(idx_r * (rmax // nr) + idx_r[: rmax % nr])
+                else:
+                    matrix.append(idx_r)
+            pairs.extend(np.array(matrix).transpose().tolist())
+
+        warmup_results = []  # finite [score, smiles, name] (real, unscaled scores)
+        batches = [[[] for _ in range(nr)] for nr in reagent_count_list]  # scaled scores per reagent
+        for chunk in tqdm(list(self._chunks(pairs, self._batch_size())),
+                          desc="RWS warmup", disable=self.hide_progress):
+            results, _built = self._score_choice_lists(chunk)
+            for choice_list, (smiles, name, score, _reason) in zip(chunk, results):
+                if np.isfinite(score):
+                    warmup_results.append([score, smiles, name])
+                    for comp_i, reagent_j in enumerate(choice_list):
+                        batches[comp_i][reagent_j].append(score * scaling)
+
+        self.num_warmup = len(pairs)
+        if not warmup_results:
+            return []
+
+        warmup_scores = [w[0] for w in warmup_results]
+        prior_mean = float(np.mean(warmup_scores)) * scaling
+        prior_std = float(np.std(warmup_scores))
+        self._warmup_std = prior_std
+        self.logger.info(
+            f"RWS warmup score stats: cnt={len(warmup_scores)}, "
+            f"mean={np.mean(warmup_scores):0.4f}, std={prior_std:0.4f}, "
+            f"min={np.min(warmup_scores):0.4f}, max={np.max(warmup_scores):0.4f}")
+
+        # Seed posteriors from the population prior, then fold in each reagent's
+        # own warm-up scores via the Boltzmann-weighted batch update.
+        self._rws_var_known = prior_std ** 2
+        self._rws_std_known = prior_std if prior_std > 0 else 1.0
+        self._rws_mu, self._rws_std, self._rws_sumw = [], [], []
+        for comp_i, nr in enumerate(reagent_count_list):
+            mu = np.full(nr, prior_mean, dtype=float)
+            std = np.full(nr, prior_std, dtype=float)
+            sumw = np.exp(mu / self._rws_std_known)
+            for j in range(nr):
+                sb = batches[comp_i][j]
+                if sb:
+                    sb_arr = np.array(sb)
+                    prior_var = std[j] ** 2
+                    denominator = len(sb) * prior_var + self._rws_var_known
+                    w_batch = np.exp(sb_arr / self._rws_std_known)
+                    mean_batch = np.average(sb_arr, weights=w_batch)
+                    w_sum = float(np.sum(w_batch))
+                    sumw[j] += w_sum
+                    mu[j] = mu[j] + (w_sum / sumw[j]) * (mean_batch - mu[j])
+                    std[j] = np.sqrt(prior_var * self._rws_var_known / denominator)
+            self._rws_mu.append(mu)
+            self._rws_std.append(std)
+            self._rws_sumw.append(sumw)
+        return warmup_results
+
+    def search_rws(self, num_targets, min_cpds_per_core=50, stop=6000):
+        """RWS search with thermal cycling.
+
+        Each cycle samples ``num_per_cycle`` reagents per component by roulette
+        wheel on Boltzmann weights of their sampled scores; one rotating component
+        is "heated" (temperature ``alpha``) while the rest are "cooled"
+        (``beta``). Temperatures rise when too few new (unique) products are found,
+        shifting from greedy to diverse. Unique products are docked in batches and
+        their reagents' posteriors updated.
+
+        ``num_targets`` is an absolute budget: the number of unique products to
+        dock in the search phase (analogous to the standard-TS ``num_cycles``),
+        so a TS vs RWS run on the same budget is apples-to-apples. Capped at the
+        library size; also stops early after ``stop`` consecutive resamples once
+        the reachable space is effectively exhausted.
+        """
+        scaling = self._rws_scaling_factor()
+        rng = np.random.default_rng(self.seed)
+        n_component = len(self.reagent_lists)
+        nsearch = min(int(num_targets), max(1, int(self.num_prods)))
+        if nsearch <= 0:
+            return []
+
+        num_per_cycle = 100
+        se_threshold = num_per_cycle * 0.1  # heat up when fewer than this many are new
+        min_cpds_per_batch = max(1, self.concurrency) * int(min_cpds_per_core)
+        alpha = beta = 0.1
+        idx_c = 0
+        uniq = {}
+        out_list = []
+        pairs_u: List[List[int]] = []
+        n_resample = 0
+        count = 0
+
+        pbar = tqdm(total=nsearch, desc="RWS search", disable=self.hide_progress)
+        try:
+            while len(uniq) < nsearch:
+                matrix = []
+                for ii in range(n_component):
+                    mu = self._rws_mu[ii]
+                    std = self._rws_std[ii]
+                    rg_score = rng.normal(size=len(mu)) * std + mu
+                    spread = np.std(rg_score)
+                    if spread == 0:
+                        spread = 1.0
+                    temp = alpha if ii == idx_c else beta
+                    w = np.exp((rg_score - np.mean(rg_score)) / spread / temp)
+                    matrix.append(rng.choice(len(mu), num_per_cycle, p=w / np.sum(w)))
+                idx_c = (idx_c + 1) % n_component
+                pairs = np.array(matrix).transpose()
+
+                n_uniq = 0
+                for comb in pairs:
+                    key = "_".join(str(r) for r in comb)
+                    if key not in uniq:
+                        pairs_u.append(list(comb))
+                        uniq[key] = None
+                        n_resample = 0
+                        n_uniq += 1
+                    else:
+                        n_resample += 1
+                if n_resample >= stop:
+                    self.logger.info(f"RWS stop: {n_resample} consecutive resamples (library effectively exhausted)")
+                    break
+
+                if len(uniq) < nsearch:
+                    # Adaptive temperature: heat up when sampling efficiency drops.
+                    if n_uniq < se_threshold:
+                        alpha += 0.01
+                        if n_uniq == 0:
+                            beta += 0.001
+                    # Defer docking until a full parallel batch has accumulated.
+                    if len(pairs_u) < min_cpds_per_batch:
+                        continue
+
+                results, _built = self._score_choice_lists(pairs_u)
+                for (smiles, name, score, _reason), comb in zip(results, pairs_u):
+                    if np.isfinite(score):
+                        out_list.append([score, smiles, name])
+                        self._rws_single_update(comb, score * scaling)
+                pbar.update(min(len(pairs_u), nsearch - pbar.n))
+                pairs_u = []
+                count += 1
+                if count % 100 == 0 and out_list:
+                    top_score, top_smiles, top_name = (max(out_list) if scaling > 0 else min(out_list))
+                    self.logger.info(f"RWS iteration {count}: best {top_score:.3f} {top_smiles} {top_name}")
+        finally:
+            pbar.close()
         return out_list
