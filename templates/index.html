@@ -134,6 +134,8 @@
       </div>
       <div class="grid3">
         <div><label>Parallel docks <span class="chip">(blank = max throughput)</span></label><input type="number" id="concurrency" placeholder="auto" min="1"></div>
+        <div><label>Random seed <span class="chip">(blank = random)</span></label><input type="number" id="seed" placeholder="random" min="0"></div>
+        <div><label>Session name <span class="chip">(rerun overwrites)</span></label><input type="text" id="sessionName" placeholder="e.g. 7Z5B_amide"></div>
       </div>
       <div class="note" id="costNote"></div>
     </div>
@@ -260,6 +262,7 @@ function buildConfig(){
         box_size:parseFloat(boxSize.value) };
   const numOrNull = el => el.value==='' ? null : parseFloat(el.value);
   return {
+    session_name: sessionName.value.trim() || null,
     steps: collectSteps(),
     binding_site: binding,
     gnina: {
@@ -279,6 +282,7 @@ function buildConfig(){
       num_warmup_trials: parseInt(warmup.value),
       num_ts_iterations: parseInt(iters.value),
       concurrency: concurrency.value==='' ? null : parseInt(concurrency.value),
+      seed: seed.value==='' ? null : parseInt(seed.value),
     },
     gpu_id: parseInt(gpu.value),
   };

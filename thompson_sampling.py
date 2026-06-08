@@ -35,6 +35,9 @@ class ThompsonSampler:
         # Number of products to score in parallel. 1 == the original sequential
         # behaviour. The evaluator must be thread-safe (GninaEvaluator is).
         self.concurrency = 1
+        # Seed for the search RNG (None == nondeterministic). warm-up uses the
+        # global numpy/random state, which the caller seeds separately.
+        self.seed = None
         self._mode = mode
         if self._mode == "maximize":
             self.pick_function = np.nanargmax
@@ -90,6 +93,10 @@ class ThompsonSampler:
         wall-clock time drops. Requires a thread-safe evaluator.
         """
         self.concurrency = max(1, int(concurrency))
+
+    def set_seed(self, seed: Optional[int]) -> None:
+        """Seed for reproducible runs. ``None`` keeps the search nondeterministic."""
+        self.seed = None if seed is None else int(seed)
 
     def read_reagents(self, reagent_file_list, num_to_select: Optional[int] = None):
         """
@@ -320,7 +327,7 @@ class ThompsonSampler:
         trade-off — which is exact when concurrency == 1.
         """
         out_list = []
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(self.seed)
         batch_size = max(1, self.concurrency)
         done = 0
         last_log = 0

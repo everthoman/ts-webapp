@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
+import re
 import shutil
 import threading
 import time
@@ -130,6 +132,12 @@ def _resolve_set(set_id: str) -> str:
     return str(path)
 
 
+def _slugify(name: str) -> str:
+    """Turn a user session name into a safe directory/job id (no path traversal)."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip()).strip("._-")
+    return slug[:64]
+
+
 def _build_route(steps_cfg: List[dict]):
     """Return (reagent_file_list, route_steps, human_summary)."""
     if not steps_cfg:
@@ -182,6 +190,16 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
             fcfg = cfg["filters"]
             mode = "minimize" if not _higher_better(gnina["score_field"]) else "maximize"
 
+            # Random seed: blank -> pick one at random, but always log it so the
+            # run can be reproduced. Seeds the global RNGs used by warm-up/search
+            # plus the per-dock gnina seed. Note: full reproducibility also needs
+            # the same concurrency, since it sets gnina's --cpu.
+            seed_cfg = ts.get("seed")
+            seed = random.randrange(1, 2**31 - 1) if seed_cfg in (None, "") else int(seed_cfg)
+            random.seed(seed)
+            np.random.seed(seed)
+            job.log(f"Random seed: {seed}")
+
             job.log(f"Score field: {gnina['score_field']}  ->  TS mode: {mode}")
             job.log("Loading filters (PAINS/REOS/property) ...")
             filters = MolFilters(
@@ -222,6 +240,7 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
                 "ph": gnina.get("ph", 7.4),
                 "gpu_id": cfg.get("gpu_id", 0),
                 "cpu": cpu_per_dock,
+                "seed": seed,
                 "work_dir": str(job.dir / "dock"),
                 "filters": filters,
                 "cancel_event": job.cancel_event,
@@ -240,6 +259,7 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
             sampler = RouteSampler(mode=mode)
             sampler.set_hide_progress(True)
             sampler.set_concurrency(concurrency)
+            sampler.set_seed(seed)
             sampler.set_evaluator(evaluator)
             sampler.read_reagents(reagent_file_list=reagent_file_list, num_to_select=None)
             sampler.set_route(route_steps)
@@ -351,8 +371,17 @@ async def run(
     cfg = json.loads(config)
     reagent_file_list, route_steps, summary = _build_route(cfg.get("steps", []))
 
-    job_id = uuid.uuid4().hex[:12]
+    # Optional human-readable session name. Re-running the same name overwrites
+    # that session's previous results; a blank name falls back to a random id
+    # (which never collides).
+    session_name = _slugify(cfg.get("session_name") or "")
+    job_id = session_name or uuid.uuid4().hex[:12]
+    existing = JOBS.get(job_id)
+    if existing is not None and existing.status in ("queued", "running"):
+        raise HTTPException(409, f"A session named '{job_id}' is already running")
     job_dir = JOBS_DIR / job_id
+    if job_dir.exists():
+        shutil.rmtree(job_dir, ignore_errors=True)  # overwrite previous results
     job_dir.mkdir(parents=True, exist_ok=True)
     job = Job(id=job_id, dir=job_dir)
     JOBS[job_id] = job
