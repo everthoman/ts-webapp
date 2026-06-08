@@ -59,13 +59,83 @@
       ]
     },
     {
-      "id": "n_acylation",
-      "name": "N-acylation of a free amine (extension step)",
+      "id": "amide_ext_amine",
+      "name": "Amide coupling (extend: amine on intermediate + acid)",
       "role": "extend",
       "takes_intermediate": true,
-      "smarts": "[NX3;H1,H2:2].[#6:4][C:3]([OH])=O>>[N:2][C:3]([#6:4])=O",
+      "smarts": "[NX3;H1,H2;!$([NX3]C=O):2].[#6:4][C:3]([OH])=O>>[N:2][C:3]([#6:4])=O",
       "components": [
         {"label": "Carboxylic acid",   "sets": ["carboxylic_acids_100", "carboxylic_acids_500", "carboxylic_acids_ok"]}
+      ]
+    },
+    {
+      "id": "amide_ext_acid",
+      "name": "Amide coupling (extend: acid on intermediate + amine)",
+      "role": "extend",
+      "takes_intermediate": true,
+      "smarts": "[#6:1][C:3](=[OX1])[OX2H1].[NX3;H1,H2;!$([NX3]C=O):2]>>[#6:1][C:3](=O)[N:2]",
+      "components": [
+        {"label": "Primary amine",     "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]}
+      ]
+    },
+    {
+      "id": "suzuki_ext_halide",
+      "name": "Suzuki coupling (extend: halide on intermediate + boronic acid)",
+      "role": "extend",
+      "takes_intermediate": true,
+      "smarts": "[c:1][Cl,Br,I].[c:2][B]([OX2])[OX2]>>[c:1][c:2]",
+      "components": [
+        {"label": "Boronic acid",      "sets": ["boronic_acids_100"]}
+      ]
+    },
+    {
+      "id": "suzuki_ext_boronic",
+      "name": "Suzuki coupling (extend: boronic acid on intermediate + halide)",
+      "role": "extend",
+      "takes_intermediate": true,
+      "smarts": "[c:2][B]([OX2])[OX2].[c:1][Cl,Br,I]>>[c:2][c:1]",
+      "components": [
+        {"label": "Aryl halide",       "sets": ["aryl_halides_100"]}
+      ]
+    },
+    {
+      "id": "snar_ext_halide",
+      "name": "SNAr (extend: aryl halide on intermediate + amine)",
+      "role": "extend",
+      "takes_intermediate": true,
+      "smarts": "[c:1][F,Cl].[NX3;H1,H2;!$([NX3]C=O):2]>>[c:1][N:2]",
+      "components": [
+        {"label": "Primary amine",     "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]}
+      ]
+    },
+    {
+      "id": "snar_ext_amine",
+      "name": "SNAr (extend: amine on intermediate + aryl halide)",
+      "role": "extend",
+      "takes_intermediate": true,
+      "smarts": "[NX3;H1,H2;!$([NX3]C=O):2].[c:1][F,Cl]>>[c:1][N:2]",
+      "components": [
+        {"label": "Activated aryl halide", "sets": ["activated_aryl_halides_100"]}
+      ]
+    },
+    {
+      "id": "redam_ext_carbonyl",
+      "name": "Reductive amination (extend: carbonyl on intermediate + amine)",
+      "role": "extend",
+      "takes_intermediate": true,
+      "smarts": "[$([CX3H1]=O),$([CX3]([#6])([#6])=O);!$([CX3](=O)[OX2]);!$([CX3](=O)[#7]):1]=[OX1].[NX3;H1,H2;!$([NX3]C=O):2]>>[C:1][N:2]",
+      "components": [
+        {"label": "Primary amine",     "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]}
+      ]
+    },
+    {
+      "id": "redam_ext_amine",
+      "name": "Reductive amination (extend: amine on intermediate + aldehyde/ketone)",
+      "role": "extend",
+      "takes_intermediate": true,
+      "smarts": "[NX3;H1,H2;!$([NX3]C=O):2].[$([CX3H1]=O),$([CX3]([#6])([#6])=O);!$([CX3](=O)[OX2]);!$([CX3](=O)[#7]):1]=[OX1]>>[C:1][N:2]",
+      "components": [
+        {"label": "Aldehyde/ketone",   "sets": ["aldehydes_ketones_100"]}
       ]
     }
   ]
