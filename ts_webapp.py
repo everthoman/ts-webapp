@@ -22,6 +22,7 @@ import os
 import random
 import re
 import shutil
+import tempfile
 import threading
 import time
 import uuid
@@ -34,6 +35,7 @@ import pandas as pd
 from fastapi import FastAPI, Form, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from rdkit import Chem
+from rdkit.Chem import Crippen, Descriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 
 from gnina_evaluator import GninaEvaluator, MolFilters, DockingCancelled, GNINA_PATH, DOCK_CPU
@@ -134,6 +136,24 @@ def _resolve_set(set_id: str) -> str:
     return str(path)
 
 
+def _write_meta(job_dir: Path, data: dict) -> None:
+    """Persist a job's metadata (config + runtime status) to job.json."""
+    try:
+        (job_dir / "job.json").write_text(json.dumps(data, indent=2, default=str))
+    except Exception:
+        pass
+
+
+def _read_meta(job_dir: Path) -> dict:
+    p = job_dir / "job.json"
+    if p.is_file():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    return {}
+
+
 def _slugify(name: str) -> str:
     """Turn a user session name into a safe directory/job id (no path traversal)."""
     slug = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip()).strip("._-")
@@ -182,8 +202,22 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
         for lg in ts_loggers:
             lg.addHandler(handler)
             lg.setLevel(logging.INFO)
+        # Persisted metadata (drives the job-history list and one-click rerun).
+        meta = {
+            "id": job.id,
+            "session_name": cfg.get("session_name"),
+            "status": "running",
+            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "config": cfg,
+            "summary": summary,
+        }
+
+        def persist():
+            _write_meta(job.dir, meta)
+
         try:
             job.status = "running"
+            persist()
             for line in summary:
                 job.log(line)
 
@@ -231,6 +265,8 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
                 f"Concurrency: {concurrency} parallel dock(s) x {cpu_per_dock} CPU each "
                 f"(budget {DOCK_CPU} CPU, exhaustiveness {exhaustiveness})"
             )
+            meta.update(seed=seed, concurrency=concurrency, cpu_per_dock=cpu_per_dock)
+            persist()
 
             eval_dict = {
                 "receptor_path": str(job.dir / "receptor.pdb"),
@@ -327,19 +363,28 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
             job.log(f"Filtered out (pre-dock): {sum(stats['rejections'].values())} {stats['rejections']}")
             job.log(f"Prep failures: {stats['prep_failures']} | dock failures: {stats['dock_failures']}")
             job.log(f"Results: {job.n_results} unique molecules, {n_poses} poses written")
+            top_meta = None
             if not out_df.empty:
                 top = out_df.iloc[0]
                 job.log(f"Top hit: {top['SMILES']}  score={top['score']:.3f}  ({top['Name']})")
+                top_meta = {"smiles": str(top["SMILES"]), "score": float(top["score"]), "name": str(top["Name"])}
             job.status = "done"
+            meta.update(status="done", finished=time.strftime("%Y-%m-%d %H:%M:%S"),
+                        n_results=job.n_results, n_poses=n_poses, top=top_meta)
+            persist()
 
         except DockingCancelled:
             job.status = "cancelled"
             job.log("Run cancelled by user.")
+            meta.update(status="cancelled", finished=time.strftime("%Y-%m-%d %H:%M:%S"))
+            persist()
         except Exception as e:  # noqa
             job.status = "error"
             job.error = str(e)
             job.log(f"ERROR: {e}")
             logging.getLogger("ts_webapp").exception("Job failed")
+            meta.update(status="error", error=str(e), finished=time.strftime("%Y-%m-%d %H:%M:%S"))
+            persist()
         finally:
             for lg in ts_loggers:
                 lg.removeHandler(handler)
@@ -403,6 +448,136 @@ async def run(
     )
     job.thread.start()
     return {"job_id": job_id}
+
+
+@app.get("/jobs")
+async def list_jobs():
+    """List past + current runs (newest first) for the history panel."""
+    items = []
+    for d in sorted(JOBS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not d.is_dir():
+            continue
+        meta = _read_meta(d)
+        live = JOBS.get(d.name)
+        has_results = (d / "results.csv").is_file()
+        status = (live.status if live is not None
+                  else meta.get("status") or ("done" if has_results else "unknown"))
+        items.append({
+            "id": d.name,
+            "session_name": meta.get("session_name"),
+            "status": status,
+            "started": meta.get("started"),
+            "finished": meta.get("finished"),
+            "n_results": (live.n_results if live is not None else meta.get("n_results")),
+            "seed": meta.get("seed"),
+            "concurrency": meta.get("concurrency"),
+            "top": meta.get("top"),
+            "summary": meta.get("summary"),
+            "has_results": has_results,
+            "has_poses": (d / "poses.sdf").is_file(),
+            "has_log": (d / "run.log").is_file(),
+            "can_rerun": bool(meta.get("config")) and (d / "receptor.pdb").is_file(),
+        })
+    return {"jobs": items}
+
+
+@app.post("/jobs/{job_id}/rerun")
+async def rerun(job_id: str):
+    """Re-run a past job from its stored config + receptor (no re-upload)."""
+    src = JOBS_DIR / job_id
+    meta = _read_meta(src)
+    cfg = meta.get("config")
+    if not cfg:
+        raise HTTPException(400, "No stored config for this run; cannot rerun")
+    if not (src / "receptor.pdb").is_file():
+        raise HTTPException(400, "Stored receptor is missing; cannot rerun")
+    live = JOBS.get(job_id)
+    if live is not None and live.status in ("queued", "running"):
+        raise HTTPException(409, f"'{job_id}' is already running")
+
+    reagent_file_list, route_steps, summary = _build_route(cfg.get("steps", []))
+
+    # Preserve the uploaded receptor/reference across the in-place overwrite.
+    has_ref = (src / "reference.sdf").is_file()
+    tmp = Path(tempfile.mkdtemp(prefix="ts_rerun_"))
+    shutil.copy(src / "receptor.pdb", tmp / "receptor.pdb")
+    if has_ref:
+        shutil.copy(src / "reference.sdf", tmp / "reference.sdf")
+    shutil.rmtree(src, ignore_errors=True)
+    src.mkdir(parents=True, exist_ok=True)
+    shutil.copy(tmp / "receptor.pdb", src / "receptor.pdb")
+    if has_ref:
+        shutil.copy(tmp / "reference.sdf", src / "reference.sdf")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    job = Job(id=job_id, dir=src)
+    JOBS[job_id] = job
+    job.thread = threading.Thread(
+        target=_run_job, args=(job, cfg, reagent_file_list, route_steps, summary), daemon=True
+    )
+    job.thread.start()
+    return {"job_id": job_id}
+
+
+@app.post("/preflight")
+async def preflight(config: str = Form(...)):
+    """Sample random products and report filter pass-rate + MW/logP spread,
+    so a too-tight filter is caught before committing to a full run."""
+    cfg = json.loads(config)
+    reagent_file_list, route_steps, _summary = _build_route(cfg.get("steps", []))
+    fcfg = cfg.get("filters", {})
+    filters = MolFilters(
+        use_pains=fcfg.get("pains", False),
+        use_reos=fcfg.get("reos", False),
+        mw_range=_range_or_none(fcfg.get("mw")),
+        logp_range=_range_or_none(fcfg.get("logp")),
+    )
+    sampler = RouteSampler(mode="minimize")
+    sampler.read_reagents(reagent_file_list=reagent_file_list, num_to_select=None)
+    sampler.set_route(route_steps)
+
+    n = 300
+    built = 0
+    reaction_fail = 0
+    passed = 0
+    rejections: Dict[str, int] = {}
+    mws: List[float] = []
+    logps: List[float] = []
+    for _ in range(n):
+        choice = [random.randrange(len(rl)) for rl in sampler.reagent_lists]
+        prod_mol, _smi, _name, _sel = sampler._build_product(choice)
+        if prod_mol is None:
+            reaction_fail += 1
+            continue
+        built += 1
+        mws.append(Descriptors.MolWt(prod_mol))
+        logps.append(Crippen.MolLogP(prod_mol))
+        reason = filters.reject_reason(prod_mol) if filters.active else None
+        if reason is None:
+            passed += 1
+        else:
+            key = reason.split(":")[0].split(" ")[0]
+            rejections[key] = rejections.get(key, 0) + 1
+
+    def spread(vals):
+        if not vals:
+            return None
+        a = np.array(vals)
+        return {k: round(float(v), 2) for k, v in
+                zip(("min", "p10", "median", "p90", "max"),
+                    np.percentile(a, [0, 10, 50, 90, 100]))}
+
+    return {
+        "sampled": n,
+        "built": built,
+        "reaction_fail": reaction_fail,
+        "passed": passed,
+        "pass_rate": round(passed / built, 3) if built else 0.0,
+        "filters_active": filters.active,
+        "rejections": rejections,
+        "mw": spread(mws),
+        "logp": spread(logps),
+    }
 
 
 @app.get("/jobs/{job_id}/status")

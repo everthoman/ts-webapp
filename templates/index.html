@@ -48,6 +48,12 @@
   .card .score { font-weight:700; }
   .card .name { color:#555; word-break:break-all; }
   .card .smi { color:#999; word-break:break-all; font-family: ui-monospace, Menlo, monospace; }
+  .jobrow { display:flex; justify-content:space-between; align-items:center; gap:8px; padding:7px 8px; border:1px solid #2f3a57; border-radius:7px; margin-bottom:6px; background:#131a29; }
+  .jobrow .jmain { min-width:0; } .jobrow b { font-size:13px; } .jobrow .sub { font-size:11px; color:var(--muted); }
+  .jobrow .jbtns { flex:0 0 auto; display:flex; gap:6px; }
+  .jobrow button { padding:4px 9px; font-size:12px; }
+  .report { font-size:12.5px; line-height:1.6; background:#0d121d; border:1px solid #2f3a57; border-radius:8px; padding:10px 12px; margin-top:10px; }
+  .report .big { font-size:15px; font-weight:700; } .report .warnote { color:var(--warn); } .report .oknote { color:var(--ok); }
 </style>
 </head>
 <body>
@@ -153,14 +159,21 @@
     <div class="panel">
       <div class="row">
         <button class="btn" id="runBtn" type="button">Run search</button>
+        <button class="btn ghost" id="preflightBtn" type="button">Check filters</button>
         <button class="btn danger" id="cancelBtn" type="button" disabled>Cancel</button>
       </div>
+      <div id="preflightReport" class="report" style="display:none"></div>
       <div id="gninaWarn" class="note" style="display:none">⚠ GNINA binary not found at the configured path — docking will fail. Set GNINA_PATH.</div>
     </div>
   </div>
 
   <!-- RIGHT: progress -->
   <div>
+    <div class="panel">
+      <h2>Past runs <button class="btn ghost" id="refreshJobs" type="button" style="float:right;padding:3px 10px">refresh</button></h2>
+      <div id="jobList" class="muted">No runs yet.</div>
+    </div>
+
     <div class="panel">
       <h2>Run status <span id="statusPill" class="pill status-queued" style="display:none"></span></h2>
       <div id="downloads" class="muted">No results yet.</div>
@@ -341,6 +354,41 @@ async function loadTop(){
 document.getElementById('refreshTop').addEventListener('click', loadTop);
 topNsel.addEventListener('change', loadTop);
 
+function resetRunView(){
+  logEl.innerHTML=''; topPanel.style.display='none'; topGrid.innerHTML='';
+  document.getElementById('downloads').innerHTML='Running…';
+}
+function showDownloads(id, status){
+  const dl = document.getElementById('downloads');
+  const logLink = `<a class="dl" href="/jobs/${id}/download/run.log">⬇ run.log</a>`;
+  if (status==='done'){
+    dl.innerHTML =
+      `<a class="dl" href="/jobs/${id}/download/results.csv">⬇ results.csv</a>` +
+      `<a class="dl" href="/jobs/${id}/download/poses.sdf">⬇ poses.sdf</a>` + logLink;
+    topPanel.style.display=''; loadTop();
+  } else {
+    dl.innerHTML = `Run ${status}. ` + logLink;
+    topPanel.style.display='none';
+  }
+}
+function attachStream(id){
+  currentJob = id;
+  setStatus('running');
+  document.getElementById('runBtn').disabled=true;
+  document.getElementById('cancelBtn').disabled=false;
+  const ev = new EventSource(`/jobs/${id}/stream`);
+  ev.onmessage = e => addLog(e.data);
+  ev.addEventListener('end', e => {
+    ev.close();
+    setStatus(e.data);
+    document.getElementById('runBtn').disabled=false;
+    document.getElementById('cancelBtn').disabled=true;
+    showDownloads(id, e.data);
+    refreshJobs();
+  });
+  ev.onerror = ()=>{ /* keep retrying until end event */ };
+}
+
 document.getElementById('runBtn').addEventListener('click', async ()=>{
   const recEl = document.getElementById('receptor');
   if (!recEl.files.length){ alert('Please upload a receptor PDB.'); return; }
@@ -353,39 +401,15 @@ document.getElementById('runBtn').addEventListener('click', async ()=>{
   fd.append('receptor', recEl.files[0]);
   if (bsMode==='reference') fd.append('reference', refEl.files[0]);
 
-  logEl.innerHTML=''; document.getElementById('downloads').innerHTML='Running…';
-  topPanel.style.display='none'; topGrid.innerHTML='';
+  resetRunView(); setStatus('queued');
   document.getElementById('runBtn').disabled=true;
-  setStatus('queued');
   let res;
   try { res = await fetch('/run',{method:'POST',body:fd}); }
   catch(e){ addLog('Network error: '+e, true); document.getElementById('runBtn').disabled=false; return; }
   if (!res.ok){ addLog('Error: '+await res.text(), true); document.getElementById('runBtn').disabled=false; return; }
   const {job_id} = await res.json();
-  currentJob = job_id;
-  document.getElementById('cancelBtn').disabled=false;
-  setStatus('running');
-
-  const ev = new EventSource(`/jobs/${job_id}/stream`);
-  ev.onmessage = e => addLog(e.data);
-  ev.addEventListener('end', e => {
-    ev.close();
-    setStatus(e.data);
-    document.getElementById('runBtn').disabled=false;
-    document.getElementById('cancelBtn').disabled=true;
-    const logLink = `<a class="dl" href="/jobs/${job_id}/download/run.log">⬇ run.log</a>`;
-    if (e.data==='done'){
-      document.getElementById('downloads').innerHTML =
-        `<a class="dl" href="/jobs/${job_id}/download/results.csv">⬇ results.csv</a>` +
-        `<a class="dl" href="/jobs/${job_id}/download/poses.sdf">⬇ poses.sdf</a>` +
-        logLink;
-      topPanel.style.display='';
-      loadTop();
-    } else {
-      document.getElementById('downloads').innerHTML = `Run ${e.data}. ` + logLink;
-    }
-  });
-  ev.onerror = ()=>{ /* keep retrying until end event */ };
+  attachStream(job_id);
+  refreshJobs();
 });
 
 document.getElementById('cancelBtn').addEventListener('click', async ()=>{
@@ -393,6 +417,89 @@ document.getElementById('cancelBtn').addEventListener('click', async ()=>{
   await fetch(`/jobs/${currentJob}/cancel`,{method:'POST'});
   addLog('Cancel requested…');
 });
+
+// ---- Pre-flight filter check ----
+async function runPreflight(){
+  const rep = document.getElementById('preflightReport');
+  rep.style.display=''; rep.innerHTML='Sampling products…';
+  const fd = new FormData(); fd.append('config', JSON.stringify(buildConfig()));
+  let data;
+  try {
+    const r = await fetch('/preflight',{method:'POST',body:fd});
+    if (!r.ok){ rep.innerHTML = `<span class="warnote">Error: ${esc(await r.text())}</span>`; return; }
+    data = await r.json();
+  } catch(e){ rep.innerHTML = '<span class="warnote">Network error</span>'; return; }
+  const pct = Math.round(data.pass_rate*100);
+  const range = o => o ? `${o.p10}–${o.p90} <span class="muted">(full ${o.min}–${o.max})</span>` : 'n/a';
+  const rejKeys = Object.keys(data.rejections);
+  const rejStr = rejKeys.length ? rejKeys.map(k=>`${k}: ${data.rejections[k]}`).join(', ') : 'none';
+  let note;
+  if (!data.filters_active) note = '<div class="oknote">No filters active — all products pass.</div>';
+  else if (pct < 20) note = `<div class="warnote">⚠ Only ${pct}% pass — most rejected by ${esc(rejKeys[0]||'filters')}. Consider widening the window (esp. logP for polar libraries).</div>`;
+  else note = `<div class="oknote">✓ ${pct}% pass — looks workable.</div>`;
+  rep.innerHTML =
+    `<div class="big">${data.passed}/${data.built} pass (${pct}%)</div>` +
+    `<div>Rejected — ${esc(rejStr)}${data.reaction_fail?` · reaction-fail ${data.reaction_fail}`:''}</div>` +
+    `<div>MW p10–p90: ${range(data.mw)}</div>` +
+    `<div>logP p10–p90: ${range(data.logp)}</div>` + note;
+}
+document.getElementById('preflightBtn').addEventListener('click', runPreflight);
+
+// ---- Job history ----
+function jobPill(s){ return `<span class="pill status-${s}">${s}</span>`; }
+async function refreshJobs(){
+  let data;
+  try { data = await (await fetch('/jobs')).json(); } catch(e){ return; }
+  const jl = document.getElementById('jobList');
+  if (!data.jobs.length){ jl.innerHTML = '<span class="muted">No runs yet.</span>'; return; }
+  jl.innerHTML = data.jobs.map(j=>{
+    const sub = [
+      j.n_results!=null ? `${j.n_results} hits` : null,
+      j.top ? `best ${(+j.top.score).toFixed(2)}` : null,
+      j.seed!=null ? `seed ${j.seed}` : null,
+      j.started || null,
+    ].filter(Boolean).join(' · ');
+    const rerunBtn = j.can_rerun ? `<button class="btn ghost" data-act="rerun" data-id="${esc(j.id)}">rerun</button>` : '';
+    return `<div class="jobrow"><div class="jmain">
+        ${jobPill(j.status)} <b>${esc(j.id)}</b>
+        <div class="sub">${esc(sub)}</div>
+      </div><div class="jbtns">
+        <button class="btn ghost" data-act="view" data-id="${esc(j.id)}" data-status="${j.status}">view</button>
+        ${rerunBtn}
+      </div></div>`;
+  }).join('');
+}
+async function loadStaticLog(id){
+  logEl.innerHTML='';
+  try {
+    const t = await (await fetch(`/jobs/${id}/download/run.log`)).text();
+    t.split('\n').forEach(l=> { if (l) addLog(l); });
+  } catch(e){ /* no log */ }
+}
+async function viewJob(id, status){
+  currentJob = id;
+  if (status==='running' || status==='queued'){ resetRunView(); attachStream(id); return; }
+  setStatus(status);
+  document.getElementById('cancelBtn').disabled=true;
+  await loadStaticLog(id);
+  showDownloads(id, status);
+}
+async function rerunJob(id){
+  resetRunView(); setStatus('queued');
+  let res;
+  try { res = await fetch(`/jobs/${id}/rerun`,{method:'POST'}); }
+  catch(e){ alert('Network error: '+e); return; }
+  if (!res.ok){ alert('Rerun failed: '+await res.text()); return; }
+  const {job_id} = await res.json();
+  attachStream(job_id); refreshJobs();
+}
+document.getElementById('jobList').addEventListener('click', e=>{
+  const b = e.target.closest('button[data-act]'); if(!b) return;
+  if (b.dataset.act==='view') viewJob(b.dataset.id, b.dataset.status);
+  else if (b.dataset.act==='rerun') rerunJob(b.dataset.id);
+});
+document.getElementById('refreshJobs').addEventListener('click', refreshJobs);
+refreshJobs();
 </script>
 </body>
 </html>
