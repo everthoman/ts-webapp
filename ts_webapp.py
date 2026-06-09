@@ -758,6 +758,10 @@ async def preflight(config: str = Form(...)):
         "rejections": rejections,
         "mw": spread(mws),
         "logp": spread(logps),
+        # Full combinatorial library = product of the per-component reagent
+        # counts (upper bound; the sampled built/passed fractions scale it to the
+        # effective enumerable+passing size).
+        "library_size": int(sampler.get_num_prods()),
     }
 
 

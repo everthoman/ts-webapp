@@ -420,13 +420,26 @@ function reagentCount(){
   collectSteps().forEach(s => s.reagent_sets.forEach(id => total += CATALOG.reagent_sets[id].count));
   return total;
 }
+// Full combinatorial library = product of the per-component reagent counts.
+function librarySize(){
+  let prod = 1;
+  collectSteps().forEach(s => s.reagent_sets.forEach(id => prod *= (CATALOG.reagent_sets[id].count||0)));
+  return prod;
+}
+function fmtBig(n){
+  if(!isFinite(n)) return '—';
+  return n>=1e5 ? n.toExponential(2).replace('e+','e') : Math.round(n).toLocaleString();
+}
 function updateCost(){
   const warm = parseInt(document.getElementById('warmup').value||'0');
   const iters = parseInt(document.getElementById('iters').value||'0');
-  const est = reagentCount()*warm + iters;
+  const rc = reagentCount();
+  const est = rc*warm + iters;
   const label = document.getElementById('method').value === 'rws' ? 'RWS search target' : 'search iterations';
   document.getElementById('costNote').textContent =
-    `≈ up to ${est.toLocaleString()} docking calls (warm-up ${reagentCount()}×${warm} + ${iters} ${label}). ` +
+    `Full combinatorial library ≈ ${fmtBig(librarySize())} products (product of component counts; ` +
+    `multi-step is an upper bound — see Check filters for the build rate). ` +
+    `≈ up to ${est.toLocaleString()} docking calls (warm-up ${rc}×${warm} + ${iters} ${label}). ` +
     `Repeated products are cached. Start small — docking dominates runtime.`;
 }
 ['warmup','iters'].forEach(id=>document.getElementById(id).addEventListener('input', updateCost));
@@ -802,12 +815,19 @@ async function runPreflight(){
   const rejKeys = Object.keys(data.rejections);
   const rejStr = rejKeys.length ? rejKeys.map(k=>`${k}: ${data.rejections[k]}`).join(', ') : 'none';
   const buildPct = data.sampled ? Math.round(data.built/data.sampled*100) : 0;
+  // Full combinatorial library (product of component counts) and the effective
+  // enumerable+passing size (scaled by the sampled build × pass fractions).
+  const lib = data.library_size||0;
+  const eff = data.sampled ? lib*data.passed/data.sampled : 0;
+  const libLine = `<div>Full combinatorial library ≈ <b>${fmtBig(lib)}</b> products` +
+    (data.built ? ` · effective (build×pass) ≈ ${fmtBig(eff)}` : '') + `</div>`;
 
   // No final product could be built at all -> the route, not the filters, is the
   // problem. Surface that clearly instead of the filter-centric "all pass" note.
   if (data.built === 0){
     rep.innerHTML =
       `<div class="big">0 products built (0/${data.sampled} sampled combinations reacted)</div>` +
+      libLine +
       `<div class="warnote">⚠ The route produced no valid products — the step-2 reaction couldn't be ` +
       `applied to the step-1 product. This is a reaction-compatibility problem, not a filter problem: ` +
       `the first step has to leave the functional group the next step needs (e.g. amide→Suzuki fails ` +
@@ -825,6 +845,7 @@ async function runPreflight(){
   if (buildPct < 50) buildNote = `<div class="warnote">⚠ Only ${buildPct}% of sampled combinations reacted to a final product — the rest failed the route chemistry. Low for a linear route is normal, but very low means few of your reagents chain through both steps.</div>`;
   rep.innerHTML =
     `<div class="big">${data.passed}/${data.built} pass (${pct}%)</div>` +
+    libLine +
     `<div>Built ${data.built}/${data.sampled} sampled${data.reaction_fail?` · reaction-fail ${data.reaction_fail}`:''}</div>` +
     `<div>Rejected — ${esc(rejStr)}</div>` +
     `<div>MW p10–p90: ${range(data.mw)}</div>` +
