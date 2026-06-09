@@ -74,6 +74,19 @@ class Job:
     evaluator: Optional[GninaEvaluator] = None
     n_results: int = 0
     started: float = field(default_factory=time.time)
+    # Search budget, set once the route is known, so the UI can draw a real
+    # progress bar / ETA against the evaluator's running evaluation count.
+    budget_warmup: int = 0
+    budget_search: int = 0
+    budget_total: int = 0
+    # CNN re-dock sub-run (refine the Vina top-X on the GPU). Tracked separately
+    # from the main run so a finished job can be refined without re-running it.
+    redock_thread: Optional[threading.Thread] = None
+    redock_evaluator: Optional[GninaEvaluator] = None
+    redock_cancel: threading.Event = field(default_factory=threading.Event)
+    redock_done: int = 0
+    redock_total: int = 0
+    redock_status: str = ""           # "" | running | done | error | cancelled
     _log_lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
@@ -345,6 +358,8 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
                 mcpc = int(ts.get("min_cpds_per_core", 50))
                 stop = int(ts.get("stop", 6000))
                 est_warm = sum(len(rl) for rl in sampler.reagent_lists) * n_warm
+                job.budget_warmup, job.budget_search = est_warm, num_targets
+                job.budget_total = est_warm + num_targets
                 job.log("Selection: Roulette Wheel Sampling + thermal cycling (Zhao 2025)")
                 job.log(f"Warm-up: ~{est_warm} docking calls; then RWS search budget "
                         f"{num_targets} products (min {mcpc}/core, resample-stop {stop})")
@@ -355,6 +370,9 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
                     num_targets=num_targets, min_cpds_per_core=mcpc, stop=stop)
             else:
                 est = sum(len(rl) for rl in sampler.reagent_lists) * n_warm
+                n_cycles = int(ts.get("num_ts_iterations", 100))
+                job.budget_warmup, job.budget_search = est, n_cycles
+                job.budget_total = est + n_cycles
                 job.log("Selection: standard Thompson Sampling (argmax)")
                 job.log(f"Warm-up: ~{est} docking calls (then {ts.get('num_ts_iterations')} search iterations)")
                 try:
@@ -425,6 +443,109 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
 def _higher_better(score_field: str) -> bool:
     from gnina_evaluator import score_field_is_higher_better
     return score_field_is_higher_better(score_field)
+
+
+# ---------------------------------------------------------------------------
+# CNN re-dock (post-run refinement of the Vina top-X on the GPU)
+# ---------------------------------------------------------------------------
+def _redock_job(job: Job, cfg: dict, rows: List[tuple], params: dict):
+    """Re-dock the top-X products of a finished run with a CNN scoring mode.
+
+    The cheap default run uses Vina (CPU) docking; CNN scoring is more accurate
+    but GPU-bound, so we refine only the shortlist here. Results land in
+    ``results_cnn.csv`` / ``poses_cnn.sdf`` next to the original outputs and are
+    surfaced through the gallery's "CNN re-dock" source toggle."""
+    with _JOB_LOCK:
+        score_field = params["score_field"]
+        cnn_scoring = params["cnn_scoring"]
+        higher = _higher_better(score_field)
+        mode = "maximize" if higher else "minimize"
+        meta = _read_meta(job.dir)
+        rmeta = {
+            "status": "running",
+            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "top_x": len(rows),
+            "cnn_scoring": cnn_scoring,
+            "score_field": score_field,
+        }
+        meta["redock"] = rmeta
+        _write_meta(job.dir, meta)
+        try:
+            job.redock_status = "running"
+            job.redock_done = 0
+            job.redock_total = len(rows)
+            gnina = cfg["gnina"]
+            job.log(f"CNN re-dock: refining top {len(rows)} products "
+                    f"(cnn_scoring={cnn_scoring}, field={score_field}, GPU {cfg.get('gpu_id', 0)})")
+
+            eval_dict = {
+                "receptor_path": str(job.dir / "receptor.pdb"),
+                "score_field": score_field,
+                "cnn_scoring": cnn_scoring,
+                "exhaustiveness": int(gnina.get("exhaustiveness", 8)),
+                "num_modes": int(gnina.get("num_modes", 9)),
+                "autobox_add": gnina.get("autobox_add", 4.0),
+                "ph": gnina.get("ph", 7.4),
+                "gpu_id": cfg.get("gpu_id", 0),
+                "cpu": DOCK_CPU,
+                "seed": meta.get("seed", 666),
+                "work_dir": str(job.dir / "redock"),
+                "filters": None,  # the shortlist already passed the run's filters
+                "cancel_event": job.redock_cancel,
+                "progress_callback": job.log,
+                "progress_every": 1,
+            }
+            bs = cfg["binding_site"]
+            if bs["mode"] == "reference":
+                eval_dict["reference_path"] = str(job.dir / "reference.sdf")
+            else:
+                eval_dict["center"] = tuple(bs["center"])
+                eval_dict["box_size"] = bs.get("box_size", 16.0)
+
+            evaluator = GninaEvaluator(eval_dict)
+            job.redock_evaluator = evaluator
+
+            for smi, name in rows:
+                if job.redock_cancel.is_set():
+                    raise DockingCancelled()
+                mol = Chem.MolFromSmiles(str(smi))
+                if mol is None:
+                    job.redock_done += 1
+                    continue
+                mol.SetProp("_Name", str(name))
+                evaluator.evaluate(mol)
+                job.redock_done += 1
+
+            scored = evaluator.top_scored(len(rows))
+            out_df = pd.DataFrame(scored, columns=["score", "SMILES", "Name"])
+            out_df = out_df.dropna(subset=["score"]).drop_duplicates(subset="SMILES")
+            out_df = out_df.sort_values("score", ascending=not higher)
+            out_df.to_csv(job.dir / "results_cnn.csv", index=False)
+            n_poses = evaluator.write_top_poses(str(job.dir / "poses_cnn.sdf"), n=200)
+
+            st = evaluator.stats()
+            job.redock_status = "done"
+            job.log(f"CNN re-dock done. Scored {len(out_df)} | dock failures {st['dock_failures']} "
+                    f"| best {score_field}={st['best_score']}")
+            if not out_df.empty:
+                top = out_df.iloc[0]
+                job.log(f"CNN top: {top['SMILES']}  {score_field}={top['score']:.3f}  ({top['Name']})")
+            rmeta.update(status="done", finished=time.strftime("%Y-%m-%d %H:%M:%S"),
+                         n_results=int(len(out_df)), n_poses=n_poses,
+                         best_score=st["best_score"])
+        except DockingCancelled:
+            job.redock_status = "cancelled"
+            job.log("CNN re-dock cancelled by user.")
+            rmeta.update(status="cancelled", finished=time.strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception as e:  # noqa
+            job.redock_status = "error"
+            job.log(f"CNN re-dock ERROR: {e}")
+            logging.getLogger("ts_webapp").exception("Re-dock failed")
+            rmeta.update(status="error", error=str(e), finished=time.strftime("%Y-%m-%d %H:%M:%S"))
+        finally:
+            meta["redock"] = rmeta
+            _write_meta(job.dir, meta)
+            job.redock_cancel.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +629,10 @@ async def list_jobs():
             "has_results": has_results,
             "has_poses": (d / "poses.sdf").is_file(),
             "has_log": (d / "run.log").is_file(),
+            "has_cnn": (d / "results_cnn.csv").is_file(),
+            "redock": meta.get("redock"),
             "can_rerun": bool(meta.get("config")) and (d / "receptor.pdb").is_file(),
+            "can_redock": has_results and bool(meta.get("config")) and (d / "receptor.pdb").is_file(),
         })
     return {"jobs": items}
 
@@ -678,11 +802,31 @@ async def status(job_id: str):
     job = JOBS.get(job_id)
     if job is None:
         raise HTTPException(404, "Unknown job")
+    # Progress for the live bar / ETA. The evaluator's evaluation counter advances
+    # ~one per warm-up product and one per search iteration (cache hits included),
+    # so it tracks the budget linearly; the client turns elapsed + fraction into
+    # an ETA. Docked/best come from the same evaluator for a one-line summary.
+    ev = job.evaluator
+    docked = best = None
+    evaluations = 0
+    if ev is not None:
+        st = ev.stats()
+        evaluations = st["evaluations"]
+        docked = st["docked"]
+        best = st["best_score"]
+    phase = "warm-up" if (job.budget_warmup and evaluations <= job.budget_warmup) else "search"
     return {
         "status": job.status,
         "n_lines": len(job.lines),
         "n_results": job.n_results,
         "error": job.error,
+        "evaluations": evaluations,
+        "docked": docked,
+        "best_score": best,
+        "budget_total": job.budget_total,
+        "budget_warmup": job.budget_warmup,
+        "phase": phase,
+        "elapsed": round(time.time() - job.started, 1),
     }
 
 
@@ -716,6 +860,83 @@ async def cancel(job_id: str):
     return {"status": "cancelling"}
 
 
+@app.post("/jobs/{job_id}/redock")
+async def redock(job_id: str, top_x: int = Form(20),
+                 cnn_scoring: str = Form("rescore"), score_field: str = Form("CNNaffinity")):
+    """Re-dock a finished run's top-X products with CNN scoring (GPU) for a more
+    accurate final ranking. Reuses the stored config (binding site, receptor)."""
+    if cnn_scoring not in ("rescore", "all"):
+        raise HTTPException(400, "cnn_scoring must be 'rescore' or 'all'")
+    if score_field not in ("CNNaffinity", "CNN_VS", "CNNscore"):
+        raise HTTPException(400, f"Unsupported CNN score field: {score_field}")
+    d = _job_dir(job_id)
+    if d is None:
+        raise HTTPException(404, "Unknown job")
+    meta = _read_meta(d)
+    cfg = meta.get("config")
+    if not cfg:
+        raise HTTPException(400, "No stored config for this run; cannot re-dock")
+    if not (d / "receptor.pdb").is_file():
+        raise HTTPException(400, "Stored receptor is missing; cannot re-dock")
+    csv_path = d / "results.csv"
+    if not csv_path.is_file():
+        raise HTTPException(400, "No results.csv to re-dock")
+    if _JOB_LOCK.locked():
+        raise HTTPException(409, "Another run is in progress; try again when it finishes")
+
+    # Resurrect a Job handle if this is a past run not in the live registry, so
+    # progress + the live gallery work the same as for a just-finished run.
+    job = JOBS.get(job_id)
+    if job is None:
+        job = Job(id=job_id, dir=d, status="done")
+        JOBS[job_id] = job
+    if job.redock_status == "running":
+        raise HTTPException(409, "A CNN re-dock is already running for this job")
+
+    top_x = max(1, min(int(top_x), 200))
+    df = pd.read_csv(csv_path)  # already sorted best-first
+    rows = [(r.SMILES, r.Name) for r in df.head(top_x).itertuples(index=False)]
+    if not rows:
+        raise HTTPException(400, "No products to re-dock")
+
+    job.redock_cancel.clear()
+    job.redock_thread = threading.Thread(
+        target=_redock_job,
+        args=(job, cfg, rows, {"cnn_scoring": cnn_scoring, "score_field": score_field}),
+        daemon=True,
+    )
+    job.redock_thread.start()
+    return {"job_id": job_id, "top_x": len(rows)}
+
+
+@app.get("/jobs/{job_id}/redock/status")
+async def redock_status(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None:
+        # Past run reloaded after a restart: report from disk.
+        d = _job_dir(job_id)
+        meta = _read_meta(d) if d is not None else {}
+        r = meta.get("redock") or {}
+        return {"status": r.get("status", ""), "done": 0,
+                "total": r.get("top_x", 0), "best_score": r.get("best_score")}
+    best = job.redock_evaluator.stats()["best_score"] if job.redock_evaluator is not None else None
+    return {
+        "status": job.redock_status,
+        "done": job.redock_done,
+        "total": job.redock_total,
+        "best_score": best,
+    }
+
+
+@app.post("/jobs/{job_id}/redock/cancel")
+async def redock_cancel(job_id: str):
+    job = JOBS.get(job_id)
+    if job is None or job.redock_status != "running":
+        raise HTTPException(404, "No running re-dock for this job")
+    job.redock_cancel.set()
+    return {"status": "cancelling"}
+
+
 def _mol_svg(smiles: str, width: int = 230, height: int = 180) -> str:
     """Render a SMILES to an inline SVG (XML declaration stripped)."""
     mol = Chem.MolFromSmiles(smiles)
@@ -745,16 +966,24 @@ def _top_items(rows) -> list:
 
 
 @app.get("/jobs/{job_id}/top")
-async def top(job_id: str, n: int = 12):
+async def top(job_id: str, n: int = 12, source: str = "vina"):
     """Top-N ranked products with structure SVG, score and reagent combination.
 
-    While a run is in progress the standings are read live from its evaluator;
-    once finished (or for past runs) they come from the persisted results.csv."""
+    ``source`` selects the original Vina run (``vina``, ``results.csv``) or the
+    CNN re-dock refinement (``cnn``, ``results_cnn.csv``). While the relevant
+    pass is in progress the standings are read live from its evaluator; once
+    finished (or for past runs) they come from the persisted CSV."""
     n = max(1, min(int(n), 60))
+    is_cnn = source == "cnn"
 
-    # Live view: a running job's evaluator holds every score gathered so far.
+    # Live view: a running pass's evaluator holds every score gathered so far.
     live = JOBS.get(job_id)
-    if live is not None and live.status == "running" and live.evaluator is not None:
+    if is_cnn:
+        if live is not None and live.redock_status == "running" and live.redock_evaluator is not None:
+            rows = live.redock_evaluator.top_scored(n)
+            total = live.redock_evaluator.stats()["unique_scored"]
+            return {"ready": bool(rows), "live": True, "items": _top_items(rows), "total": total}
+    elif live is not None and live.status == "running" and live.evaluator is not None:
         rows = live.evaluator.top_scored(n)
         total = live.evaluator.stats()["unique_scored"]
         return {"ready": bool(rows), "live": True, "items": _top_items(rows), "total": total}
@@ -762,7 +991,7 @@ async def top(job_id: str, n: int = 12):
     d = _job_dir(job_id)
     if d is None:
         raise HTTPException(404, "Unknown job")
-    csv_path = d / "results.csv"
+    csv_path = d / ("results_cnn.csv" if is_cnn else "results.csv")
     if not csv_path.is_file():
         return {"ready": False, "live": False, "items": []}
     try:
@@ -778,7 +1007,7 @@ async def download(job_id: str, name: str):
     d = _job_dir(job_id)
     if d is None:
         raise HTTPException(404, "Unknown job")
-    if name not in ("results.csv", "poses.sdf", "run.log"):
+    if name not in ("results.csv", "poses.sdf", "run.log", "results_cnn.csv", "poses_cnn.sdf"):
         raise HTTPException(400, "Invalid file")
     path = d / name
     if not path.is_file():

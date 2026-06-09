@@ -55,6 +55,14 @@
   .sub { font-size:11.5px; color:var(--muted); }
   .report { font-size:12.5px; line-height:1.6; background:#0d121d; border:1px solid #2f3a57; border-radius:8px; padding:10px 12px; margin-top:10px; }
   .report .big { font-size:15px; font-weight:700; } .report .warnote { color:var(--warn); } .report .oknote { color:var(--ok); }
+  .panel h2 .h2btn { float:right; font-size:11px; font-weight:600; padding:2px 9px; background:#28324c; color:var(--text); border-radius:6px; }
+  .progress { margin:4px 0 8px; }
+  .progress .track { height:9px; background:#0d121d; border:1px solid #2f3a57; border-radius:999px; overflow:hidden; }
+  .progress .track .bar { height:100%; width:0%; background:linear-gradient(90deg,#234a7a,var(--accent)); transition:width .4s ease; }
+  .progress .ptext { font-size:11.5px; color:var(--muted); margin-top:5px; }
+  .redockbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; padding-top:8px; border-top:1px solid #2a3550; }
+  .redockbar input[type=number] { width:64px; } .redockbar select { width:auto; }
+  .redockbar button { padding:6px 11px; font-size:12px; }
 </style>
 </head>
 <body>
@@ -195,7 +203,12 @@
     </div>
 
     <div class="panel">
-      <h2>Run status <span id="statusPill" class="pill status-queued" style="display:none"></span></h2>
+      <h2>Run status <span id="statusPill" class="pill status-queued" style="display:none"></span>
+        <button class="h2btn" id="logToggle" type="button">hide console</button></h2>
+      <div id="progress" class="progress" style="display:none">
+        <div class="track"><div class="bar" id="progBar"></div></div>
+        <div class="ptext" id="progText"></div>
+      </div>
       <div id="downloads" class="muted">No results yet.</div>
       <div id="log" style="margin-top:10px"><span class="muted">Logs will stream here…</span></div>
     </div>
@@ -205,8 +218,28 @@
       <div class="topbar">
         <span class="muted">Show top</span>
         <select id="topN"><option>6</option><option selected>12</option><option>24</option><option>48</option></select>
+        <select id="topSource" style="width:auto">
+          <option value="vina">Vina (run)</option>
+          <option value="cnn" disabled>CNN re-dock</option>
+        </select>
         <button class="btn ghost" id="refreshTop" type="button">refresh</button>
         <span class="muted" id="topMeta"></span>
+      </div>
+      <div class="redockbar" id="redockBar" style="display:none">
+        <span class="muted">Refine top</span>
+        <input type="number" id="redockN" value="20" min="1" max="200">
+        <span class="muted">with CNN</span>
+        <select id="redockScore">
+          <option value="CNNaffinity">CNNaffinity</option>
+          <option value="CNN_VS">CNN_VS</option>
+        </select>
+        <select id="redockMode">
+          <option value="rescore">rescore</option>
+          <option value="all">all</option>
+        </select>
+        <button class="btn" id="redockBtn" type="button">Re-dock (GPU)</button>
+        <button class="btn danger" id="redockCancel" type="button" style="display:none">cancel</button>
+        <span class="muted" id="redockMeta"></span>
       </div>
       <div id="topGrid" class="topgrid"></div>
     </div>
@@ -403,22 +436,71 @@ const pill = document.getElementById('statusPill');
 function setStatus(s){ pill.style.display='inline-block'; pill.className='pill status-'+s; pill.textContent=s; }
 function addLog(line, bad){ const d=document.createElement('div'); if(bad)d.className='bad'; d.textContent=line; logEl.appendChild(d); logEl.scrollTop=logEl.scrollHeight; }
 
+// ---- Collapsible console ----
+const logToggle = document.getElementById('logToggle');
+logToggle.addEventListener('click', ()=>{
+  const hidden = logEl.style.display==='none';
+  logEl.style.display = hidden ? '' : 'none';
+  logToggle.textContent = hidden ? 'hide console' : 'show console';
+});
+
+// ---- Live progress bar + ETA ----
+// The server reports evaluations against the known search budget (warm-up +
+// search), which advances ~linearly; turning elapsed + fraction into an ETA
+// self-corrects as the SMILES cache speeds later iterations up.
+const progEl = document.getElementById('progress');
+const progBar = document.getElementById('progBar');
+const progText = document.getElementById('progText');
+let progTimer = null;
+function fmtETA(sec){
+  if(!isFinite(sec) || sec<0) return '—';
+  sec = Math.round(sec);
+  if(sec<60) return sec+'s';
+  const m=Math.floor(sec/60), s=sec%60;
+  if(m<60) return `${m}m${String(s).padStart(2,'0')}s`;
+  const h=Math.floor(m/60); return `${h}h${String(m%60).padStart(2,'0')}m`;
+}
+function stopProgress(){ if(progTimer){ clearInterval(progTimer); progTimer=null; } }
+async function pollProgress(id){
+  let s; try { s = await (await fetch(`/jobs/${id}/status`)).json(); } catch(e){ return; }
+  const total = s.budget_total||0, ev = s.evaluations||0;
+  const frac = total>0 ? Math.min(ev/total, 0.999) : 0;
+  progBar.style.width = (frac*100).toFixed(1)+'%';
+  let eta='';
+  if(s.status==='running' && frac>0.02 && s.elapsed>0) eta = ' · ETA '+fmtETA(s.elapsed*(1-frac)/frac);
+  const best = s.best_score!=null ? (+s.best_score).toFixed(2) : '—';
+  progText.textContent = total>0
+    ? `${s.phase} · ${ev}/${total} (${Math.round(frac*100)}%) · ${s.docked||0} docked · best ${best}${eta}`
+    : `${s.status}…`;
+  if(['done','error','cancelled'].includes(s.status)){ stopProgress(); progBar.style.width='100%'; }
+}
+function startProgress(id){
+  stopProgress();
+  progEl.style.display=''; progBar.style.width='0%'; progText.textContent='starting…';
+  pollProgress(id); progTimer=setInterval(()=>pollProgress(id), 2500);
+}
+function hideProgress(){ stopProgress(); progEl.style.display='none'; }
+
 const topPanel = document.getElementById('topPanel');
 const topGrid = document.getElementById('topGrid');
 const topNsel = document.getElementById('topN');
+const topSource = document.getElementById('topSource');
+const redockBar = document.getElementById('redockBar');
 function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 async function loadTop(){
   if(!currentJob) return;
   const n = parseInt(topNsel.value);
+  const source = topSource.value;
   // Only show the placeholder on the first paint; live polling refreshes in
   // place so the gallery doesn't flicker every tick.
   if(!topGrid.querySelector('.card')) topGrid.innerHTML = '<span class="muted">Loading…</span>';
   let data;
-  try { data = await (await fetch(`/jobs/${currentJob}/top?n=${n}`)).json(); }
+  try { data = await (await fetch(`/jobs/${currentJob}/top?n=${n}&source=${source}`)).json(); }
   catch(e){ if(!topGrid.querySelector('.card')) topGrid.innerHTML = '<span class="muted">Error loading results.</span>'; return; }
   if(!data.ready || !data.items.length){ if(!topGrid.querySelector('.card')) topGrid.innerHTML = '<span class="muted">No results yet.</span>'; return; }
+  const tag = source==='cnn' ? 'CNN' : 'Vina';
   document.getElementById('topMeta').textContent =
-    (data.live ? `live · updating · best ${data.total} so far` : `of ${data.total} unique molecules`);
+    (data.live ? `${tag} · live · best ${data.total} so far` : `${tag} · of ${data.total} unique molecules`);
   topGrid.innerHTML = data.items.map(it => `
     <div class="card">
       ${it.svg || '<div class="muted" style="color:#888">no structure</div>'}
@@ -431,6 +513,7 @@ async function loadTop(){
 }
 document.getElementById('refreshTop').addEventListener('click', loadTop);
 topNsel.addEventListener('change', loadTop);
+topSource.addEventListener('change', ()=>{ topGrid.innerHTML=''; loadTop(); });
 
 let liveTopTimer = null;
 function stopLiveTop(){ if(liveTopTimer){ clearInterval(liveTopTimer); liveTopTimer=null; } }
@@ -444,20 +527,48 @@ function startLiveTop(){
 }
 
 function resetRunView(){
-  logEl.innerHTML=''; stopLiveTop(); topPanel.style.display='none'; topGrid.innerHTML='';
+  logEl.innerHTML=''; stopLiveTop(); stopRedockPoll(); hideProgress();
+  topPanel.style.display='none'; topGrid.innerHTML='';
+  topSource.value='vina'; setRedockSource(false); redockBar.style.display='none';
   document.getElementById('downloads').innerHTML='Running…';
 }
-function showDownloads(id, status){
+// Enable/disable the gallery's "CNN re-dock" source option.
+function setRedockSource(hasCnn){
+  const opt = topSource.querySelector('option[value="cnn"]');
+  if(opt) opt.disabled = !hasCnn;
+  if(!hasCnn && topSource.value==='cnn'){ topSource.value='vina'; }
+}
+// Configure the CNN re-dock toolbar for a finished run (job = /jobs listing entry).
+function setupRedockBar(id, job){
+  const canRedock = !job || job.can_redock !== false;
+  redockBar.style.display = canRedock ? '' : 'none';
+  setRedockSource(!!(job && job.has_cnn));
+  const r = job && job.redock;
+  document.getElementById('redockMeta').textContent =
+    r && r.status==='done' ? `CNN: ${r.n_results||0} scored (top ${r.top_x}, ${r.cnn_scoring})` : '';
+  document.getElementById('redockBtn').disabled = false;
+  document.getElementById('redockCancel').style.display='none';
+}
+function cnnLinks(id){
+  return `<a class="dl" href="/jobs/${id}/download/results_cnn.csv">⬇ results_cnn.csv</a>` +
+         `<a class="dl" href="/jobs/${id}/download/poses_cnn.sdf">⬇ poses_cnn.sdf</a>`;
+}
+function showDownloads(id, status, job){
   const dl = document.getElementById('downloads');
   const logLink = `<a class="dl" href="/jobs/${id}/download/run.log">⬇ run.log</a>`;
   if (status==='done'){
-    dl.innerHTML =
+    let links =
       `<a class="dl" href="/jobs/${id}/download/results.csv">⬇ results.csv</a>` +
-      `<a class="dl" href="/jobs/${id}/download/poses.sdf">⬇ poses.sdf</a>` + logLink;
-    topPanel.style.display=''; loadTop();
+      `<a class="dl" href="/jobs/${id}/download/poses.sdf">⬇ poses.sdf</a>`;
+    if (job && job.has_cnn) links += cnnLinks(id);
+    dl.innerHTML = links + logLink;
+    topPanel.style.display='';
+    setupRedockBar(id, job);
+    loadTop();
   } else {
     dl.innerHTML = `Run ${status}. ` + logLink;
     topPanel.style.display='none';
+    redockBar.style.display='none';
   }
 }
 function attachStream(id){
@@ -466,19 +577,65 @@ function attachStream(id){
   document.getElementById('runBtn').disabled=true;
   document.getElementById('cancelBtn').disabled=false;
   startLiveTop();
+  startProgress(id);
   const ev = new EventSource(`/jobs/${id}/stream`);
   ev.onmessage = e => addLog(e.data);
   ev.addEventListener('end', e => {
     ev.close();
     stopLiveTop();
+    stopProgress();
     setStatus(e.data);
     document.getElementById('runBtn').disabled=false;
     document.getElementById('cancelBtn').disabled=true;
-    showDownloads(id, e.data);
+    showDownloads(id, e.data, jobsById[id]);
     refreshJobs();
   });
   ev.onerror = ()=>{ /* keep retrying until end event */ };
 }
+
+// ---- CNN re-dock (refine the Vina top-X on the GPU) ----
+let redockTimer = null;
+function stopRedockPoll(){ if(redockTimer){ clearInterval(redockTimer); redockTimer=null; } }
+function startRedockPoll(id){
+  stopRedockPoll();
+  const btn=document.getElementById('redockBtn'), cancel=document.getElementById('redockCancel');
+  btn.disabled=true; cancel.style.display='';
+  setRedockSource(true); topSource.value='cnn'; topGrid.innerHTML=''; loadTop();
+  const tick = async ()=>{
+    let s; try { s = await (await fetch(`/jobs/${id}/redock/status`)).json(); } catch(e){ return; }
+    document.getElementById('redockMeta').textContent =
+      `CNN ${s.status||'starting'} · ${s.done}/${s.total}` +
+      (s.best_score!=null ? ` · best ${(+s.best_score).toFixed(2)}` : '');
+    if(topSource.value==='cnn') loadTop();
+    if(['done','error','cancelled'].includes(s.status)){
+      stopRedockPoll(); btn.disabled=false; cancel.style.display='none';
+      if(s.status==='done'){
+        const dl=document.getElementById('downloads');
+        if(dl && !dl.querySelector('[href$="results_cnn.csv"]')) dl.insertAdjacentHTML('afterbegin', cnnLinks(id));
+        setRedockSource(true);
+      }
+      refreshJobs();
+    }
+  };
+  tick(); redockTimer=setInterval(tick, 4000);
+}
+document.getElementById('redockBtn').addEventListener('click', async ()=>{
+  if(!currentJob){ return; }
+  const fd = new FormData();
+  fd.append('top_x', document.getElementById('redockN').value||'20');
+  fd.append('cnn_scoring', document.getElementById('redockMode').value);
+  fd.append('score_field', document.getElementById('redockScore').value);
+  let res;
+  try { res = await fetch(`/jobs/${currentJob}/redock`,{method:'POST',body:fd}); }
+  catch(e){ alert('Network error: '+e); return; }
+  if(!res.ok){ alert('Re-dock failed: '+await res.text()); return; }
+  startRedockPoll(currentJob);
+});
+document.getElementById('redockCancel').addEventListener('click', async ()=>{
+  if(!currentJob) return;
+  try { await fetch(`/jobs/${currentJob}/redock/cancel`,{method:'POST'}); } catch(e){}
+  addLog('CNN re-dock cancel requested…');
+});
 
 document.getElementById('runBtn').addEventListener('click', async ()=>{
   const recEl = document.getElementById('receptor');
@@ -612,14 +769,14 @@ async function loadStaticLog(id){
     t.split('\n').forEach(l=> { if (l) addLog(l); });
   } catch(e){ /* no log */ }
 }
-async function viewJob(id, status){
+async function viewJob(id, status, job){
   currentJob = id;
-  stopLiveTop();
+  stopLiveTop(); stopRedockPoll(); hideProgress();
   if (status==='running' || status==='queued'){ resetRunView(); attachStream(id); return; }
   setStatus(status);
   document.getElementById('cancelBtn').disabled=true;
   await loadStaticLog(id);
-  showDownloads(id, status);
+  showDownloads(id, status, job || jobsById[id]);
 }
 async function rerunJob(id){
   resetRunView(); setStatus('queued');
@@ -631,7 +788,7 @@ async function rerunJob(id){
   attachStream(job_id); refreshJobs();
 }
 jobSelect.addEventListener('change', updateJobControls);
-document.getElementById('jobView').addEventListener('click', ()=>{ const j=selectedJob(); if(j) viewJob(j.id, j.status); });
+document.getElementById('jobView').addEventListener('click', ()=>{ const j=selectedJob(); if(j) viewJob(j.id, j.status, j); });
 document.getElementById('jobRerun').addEventListener('click', ()=>{ const j=selectedJob(); if(j&&j.can_rerun) rerunJob(j.id); });
 document.getElementById('jobDelete').addEventListener('click', ()=>{ const j=selectedJob(); if(j) deleteJob(j.id); });
 document.getElementById('refreshJobs').addEventListener('click', refreshJobs);
