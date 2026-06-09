@@ -580,15 +580,18 @@ function attachStream(id){
   startProgress(id);
   const ev = new EventSource(`/jobs/${id}/stream`);
   ev.onmessage = e => addLog(e.data);
-  ev.addEventListener('end', e => {
+  ev.addEventListener('end', async e => {
     ev.close();
     stopLiveTop();
     stopProgress();
     setStatus(e.data);
     document.getElementById('runBtn').disabled=false;
     document.getElementById('cancelBtn').disabled=true;
+    // Refresh the job cache *first*: the entry from while it was running has no
+    // results.csv yet (can_redock=false), which would wrongly hide the re-dock
+    // toolbar. The post-finish listing has the correct flags.
+    await refreshJobs();
     showDownloads(id, e.data, jobsById[id]);
-    refreshJobs();
   });
   ev.onerror = ()=>{ /* keep retrying until end event */ };
 }
