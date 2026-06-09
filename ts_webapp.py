@@ -158,6 +158,21 @@ def _write_meta(job_dir: Path, data: dict) -> None:
         pass
 
 
+def _write_convergence(job_dir: Path, evaluator, score_field: str) -> None:
+    """Persist the best-score-so-far curve so past runs can redraw it."""
+    try:
+        pts = evaluator.convergence()
+        (job_dir / "convergence.json").write_text(json.dumps({
+            "score_field": score_field,
+            "higher_better": evaluator.higher_is_better,
+            "docked": evaluator.stats()["docked"],
+            "best": evaluator.stats()["best_score"],
+            "points": [{"dock": d, "best": b} for d, b in pts],
+        }))
+    except Exception:
+        pass
+
+
 def _read_meta(job_dir: Path) -> dict:
     p = job_dir / "job.json"
     if p.is_file():
@@ -339,6 +354,13 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
             n_warm = int(ts.get("num_warmup_trials", 3))
             method = (ts.get("method") or "ts").lower()
 
+            # Optional plateau auto-stop: end the search once the best score has
+            # not improved for this many consecutive docks. Blank / 0 disables it.
+            pat_cfg = ts.get("patience")
+            patience = int(pat_cfg) if pat_cfg not in (None, "") and int(pat_cfg) > 0 else None
+            if patience:
+                job.log(f"Auto-stop enabled: stop if no score improvement in {patience} docks")
+
             def _no_warmup_scores() -> RuntimeError:
                 st = evaluator.stats()
                 return RuntimeError(
@@ -367,7 +389,7 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
                 if not warmup_results:
                     raise _no_warmup_scores()
                 search_results = sampler.search_rws(
-                    num_targets=num_targets, min_cpds_per_core=mcpc, stop=stop)
+                    num_targets=num_targets, min_cpds_per_core=mcpc, stop=stop, patience=patience)
             else:
                 est = sum(len(rl) for rl in sampler.reagent_lists) * n_warm
                 n_cycles = int(ts.get("num_ts_iterations", 100))
@@ -385,7 +407,7 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
                 if not warmup_results:
                     raise _no_warmup_scores()
                 try:
-                    search_results = sampler.search(num_cycles=int(ts.get("num_ts_iterations", 100)))
+                    search_results = sampler.search(num_cycles=n_cycles, patience=patience)
                 except ValueError as e:
                     # nanargmin/nanargmax raise "All-NaN slice encountered" once the
                     # disallow tracker has exhausted a (typically very small) library.
@@ -407,6 +429,7 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
 
             poses_sdf = job.dir / "poses.sdf"
             n_poses = evaluator.write_top_poses(str(poses_sdf), n=200)
+            _write_convergence(job.dir, evaluator, gnina["score_field"])
 
             stats = evaluator.stats()
             job.log(f"Done. Unique scored: {stats['unique_scored']} | docked: {stats['docked']}")
@@ -426,6 +449,8 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
         except DockingCancelled:
             job.status = "cancelled"
             job.log("Run cancelled by user.")
+            if job.evaluator is not None:
+                _write_convergence(job.dir, job.evaluator, cfg["gnina"]["score_field"])
             meta.update(status="cancelled", finished=time.strftime("%Y-%m-%d %H:%M:%S"))
             persist()
         except Exception as e:  # noqa
@@ -1000,6 +1025,36 @@ async def top(job_id: str, n: int = 12, source: str = "vina"):
         return {"ready": False, "live": False, "items": []}
     rows = [(row.score, row.SMILES, row.Name) for row in df.head(n).itertuples(index=False)]
     return {"ready": True, "live": False, "items": _top_items(rows), "total": int(len(df))}
+
+
+@app.get("/jobs/{job_id}/convergence")
+async def convergence(job_id: str):
+    """Best-score-so-far vs docks, for the convergence chart. Served live from a
+    running job's evaluator, else from the persisted convergence.json."""
+    live = JOBS.get(job_id)
+    if live is not None and live.status == "running" and live.evaluator is not None:
+        ev = live.evaluator
+        pts = ev.convergence()
+        st = ev.stats()
+        return {
+            "ready": bool(pts), "live": True,
+            "score_field": ev.score_field, "higher_better": ev.higher_is_better,
+            "docked": st["docked"], "best": st["best_score"],
+            "points": [{"dock": d, "best": b} for d, b in pts],
+        }
+    d = _job_dir(job_id)
+    if d is None:
+        raise HTTPException(404, "Unknown job")
+    p = d / "convergence.json"
+    if not p.is_file():
+        return {"ready": False, "live": False, "points": []}
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        return {"ready": False, "live": False, "points": []}
+    data["ready"] = bool(data.get("points"))
+    data["live"] = False
+    return data
 
 
 @app.get("/jobs/{job_id}/download/{name}")

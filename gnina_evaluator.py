@@ -369,6 +369,11 @@ class GninaEvaluator(Evaluator):
         self.prep_failures = 0
         self.dock_failures = 0
         self._best_score: Optional[float] = None
+        # Convergence tracking: a (dock_count, best_score) point each time the
+        # running best improves, plus a counter of docks since the last
+        # improvement so the sampler can auto-stop on a plateau.
+        self._best_history: List[Tuple[int, float]] = []
+        self._docks_since_best = 0
 
     # -- Evaluator interface ------------------------------------------------
     @property
@@ -533,22 +538,48 @@ class GninaEvaluator(Evaluator):
 
     # -- Progress + output --------------------------------------------------
     def _emit_progress(self, score: float) -> None:
+        msg = None
         with self._lock:
+            improved = False
             if np.isfinite(score):
                 if self._best_score is None or (
                     score > self._best_score if self.higher_is_better else score < self._best_score
                 ):
                     self._best_score = score
-            if self.progress_callback is None or self._dock_count % self.progress_every != 0:
-                return
-            best = f"{self._best_score:.3f}" if self._best_score is not None else "n/a"
-            rej = sum(self.rejections.values())
-            msg = (
-                f"docked {self._dock_count} | best {self.score_field}={best} | "
-                f"filtered {rej} | prep_fail {self.prep_failures} | dock_fail {self.dock_failures}"
-            )
+                    improved = True
+            # Record the convergence point on improvement; otherwise count this
+            # dock toward the no-improvement plateau window.
+            if improved:
+                self._best_history.append((self._dock_count, float(self._best_score)))
+                self._docks_since_best = 0
+            else:
+                self._docks_since_best += 1
+            if self.progress_callback is not None and self._dock_count % self.progress_every == 0:
+                best = f"{self._best_score:.3f}" if self._best_score is not None else "n/a"
+                rej = sum(self.rejections.values())
+                msg = (
+                    f"docked {self._dock_count} | best {self.score_field}={best} | "
+                    f"filtered {rej} | prep_fail {self.prep_failures} | dock_fail {self.dock_failures}"
+                )
         # Call out to the (possibly slow) callback without holding the lock.
-        self.progress_callback(msg)
+        if msg is not None:
+            self.progress_callback(msg)
+
+    @property
+    def docks_since_best(self) -> int:
+        """Docks since the running best last improved (for plateau auto-stop)."""
+        return self._docks_since_best
+
+    def reset_plateau(self) -> None:
+        """Zero the no-improvement counter, e.g. when the search phase begins so
+        the plateau window is measured over search docks, not warm-up."""
+        with self._lock:
+            self._docks_since_best = 0
+
+    def convergence(self) -> List[Tuple[int, float]]:
+        """Best-score-so-far as (dock_count, best) points, one per improvement."""
+        with self._lock:
+            return list(self._best_history)
 
     def top_scored(self, n: int = 12) -> List[Tuple[float, str, str]]:
         """Current best ``(score, smiles, name)`` rows, best-first.

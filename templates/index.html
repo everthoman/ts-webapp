@@ -63,6 +63,11 @@
   .redockbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-top:8px; padding-top:8px; border-top:1px solid #2a3550; }
   .redockbar input[type=number] { width:64px; } .redockbar select { width:auto; }
   .redockbar button { padding:6px 11px; font-size:12px; }
+  #convChart svg { width:100%; height:auto; display:block; }
+  #convChart .axis { stroke:#2f3a57; stroke-width:1; }
+  #convChart .grid { stroke:#1c2740; stroke-width:1; }
+  #convChart .curve { fill:none; stroke:var(--accent); stroke-width:2; }
+  #convChart .lbl { fill:var(--muted); font-size:10px; font-family:ui-monospace,Menlo,monospace; }
 </style>
 </head>
 <body>
@@ -173,6 +178,7 @@
       </div>
       <div class="grid3">
         <div><label>Session name <span class="chip">(rerun overwrites)</span></label><input type="text" id="sessionName" placeholder="e.g. 7Z5B_amide"></div>
+        <div><label>Auto-stop <span class="chip">(stop after N docks w/o improvement)</span></label><input type="number" id="patience" placeholder="off" min="1"></div>
       </div>
       <div class="note" id="costNote"></div>
     </div>
@@ -242,6 +248,11 @@
         <span class="muted" id="redockMeta"></span>
       </div>
       <div id="topGrid" class="topgrid"></div>
+    </div>
+
+    <div class="panel" id="convPanel" style="display:none">
+      <h2>Convergence <span class="muted" id="convMeta" style="font-weight:400"></span></h2>
+      <div id="convChart"></div>
     </div>
   </div>
 </div>
@@ -425,6 +436,7 @@ function buildConfig(){
       stop: parseInt(document.getElementById('rwsStop').value||'6000'),
       concurrency: concurrency.value==='' ? null : parseInt(concurrency.value),
       seed: seed.value==='' ? null : parseInt(seed.value),
+      patience: patience.value==='' ? null : parseInt(patience.value),  // plateau auto-stop (blank = off)
     },
     gpu_id: parseInt(gpu.value),
   };
@@ -481,6 +493,54 @@ function startProgress(id){
 }
 function hideProgress(){ stopProgress(); progEl.style.display='none'; }
 
+// ---- Convergence curve (best score so far vs docks) ----
+const convPanel = document.getElementById('convPanel');
+const convChart = document.getElementById('convChart');
+let convTimer = null;
+function stopConvergence(){ if(convTimer){ clearInterval(convTimer); convTimer=null; } }
+function startConvergence(id){ stopConvergence(); loadConvergence(id); convTimer=setInterval(()=>loadConvergence(id), 6000); }
+async function loadConvergence(id){
+  let data; try { data = await (await fetch(`/jobs/${id}/convergence`)).json(); } catch(e){ return; }
+  if(!data.ready || !data.points || !data.points.length){ convPanel.style.display='none'; return; }
+  convPanel.style.display='';
+  drawConvergence(data);
+}
+function drawConvergence(data){
+  const pts = data.points;
+  const W=520, H=210, mL=54, mR=14, mT=14, mB=30;
+  const xMax = Math.max(data.docked||0, pts[pts.length-1].dock, 1);
+  const ys = pts.map(p=>p.best);
+  let yMin=Math.min(...ys), yMax=Math.max(...ys);
+  if(yMin===yMax){ yMin-=1; yMax+=1; }
+  const padY=(yMax-yMin)*0.08; yMin-=padY; yMax+=padY;
+  const sx = v => mL + (v/xMax)*(W-mL-mR);
+  const sy = v => mT + (1-(v-yMin)/(yMax-yMin))*(H-mT-mB);
+  // Step line: best-so-far holds flat, then jumps at each improvement's dock.
+  let d = `M ${sx(pts[0].dock).toFixed(1)} ${sy(pts[0].best).toFixed(1)}`;
+  let prevY = pts[0].best;
+  for(let i=1;i<pts.length;i++){
+    d += ` L ${sx(pts[i].dock).toFixed(1)} ${sy(prevY).toFixed(1)} L ${sx(pts[i].dock).toFixed(1)} ${sy(pts[i].best).toFixed(1)}`;
+    prevY = pts[i].best;
+  }
+  d += ` L ${sx(xMax).toFixed(1)} ${sy(prevY).toFixed(1)}`;
+  let grid='';
+  [yMax,(yMax+yMin)/2,yMin].forEach(v=>{
+    const y=sy(v).toFixed(1);
+    grid += `<line class="grid" x1="${mL}" y1="${y}" x2="${W-mR}" y2="${y}"/>`
+          + `<text class="lbl" x="${mL-6}" y="${(+y+3).toFixed(1)}" text-anchor="end">${v.toFixed(2)}</text>`;
+  });
+  const axes = `<line class="axis" x1="${mL}" y1="${mT}" x2="${mL}" y2="${H-mB}"/>`
+             + `<line class="axis" x1="${mL}" y1="${H-mB}" x2="${W-mR}" y2="${H-mB}"/>`;
+  const xlab = `<text class="lbl" x="${mL}" y="${H-8}" text-anchor="start">0</text>`
+             + `<text class="lbl" x="${W-mR}" y="${H-8}" text-anchor="end">${xMax} docks</text>`;
+  convChart.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">`
+    + grid + axes + `<path class="curve" d="${d}"/>` + xlab + `</svg>`;
+  const arrow = data.higher_better ? '↑ higher better' : '↓ lower better';
+  const best = data.best!=null ? (+data.best).toFixed(3) : '—';
+  document.getElementById('convMeta').textContent =
+    `${data.score_field} (${arrow}) · best ${best} · ${pts.length} improvement${pts.length===1?'':'s'} over ${xMax} docks` + (data.live?' · live':'');
+}
+
 const topPanel = document.getElementById('topPanel');
 const topGrid = document.getElementById('topGrid');
 const topNsel = document.getElementById('topN');
@@ -528,6 +588,7 @@ function startLiveTop(){
 
 function resetRunView(){
   logEl.innerHTML=''; stopLiveTop(); stopRedockPoll(); hideProgress();
+  stopConvergence(); convPanel.style.display='none';
   topPanel.style.display='none'; topGrid.innerHTML='';
   topSource.value='vina'; setRedockSource(false); redockBar.style.display='none';
   document.getElementById('downloads').innerHTML='Running…';
@@ -565,6 +626,7 @@ function showDownloads(id, status, job){
     topPanel.style.display='';
     setupRedockBar(id, job);
     loadTop();
+    loadConvergence(id);
   } else {
     dl.innerHTML = `Run ${status}. ` + logLink;
     topPanel.style.display='none';
@@ -578,12 +640,15 @@ function attachStream(id){
   document.getElementById('cancelBtn').disabled=false;
   startLiveTop();
   startProgress(id);
+  startConvergence(id);
   const ev = new EventSource(`/jobs/${id}/stream`);
   ev.onmessage = e => addLog(e.data);
   ev.addEventListener('end', async e => {
     ev.close();
     stopLiveTop();
     stopProgress();
+    stopConvergence();
+    loadConvergence(id);
     setStatus(e.data);
     document.getElementById('runBtn').disabled=false;
     document.getElementById('cancelBtn').disabled=true;
@@ -774,7 +839,7 @@ async function loadStaticLog(id){
 }
 async function viewJob(id, status, job){
   currentJob = id;
-  stopLiveTop(); stopRedockPoll(); hideProgress();
+  stopLiveTop(); stopRedockPoll(); hideProgress(); stopConvergence();
   if (status==='running' || status==='queued'){ resetRunView(); attachStream(id); return; }
   setStatus(status);
   document.getElementById('cancelBtn').disabled=true;

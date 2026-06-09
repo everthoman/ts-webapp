@@ -376,9 +376,11 @@ class ThompsonSampler:
         self._disallow_tracker.update(selected_reagents)
         return selected_reagents
 
-    def search(self, num_cycles=25):
+    def search(self, num_cycles=25, patience=None):
         """Run the search
         :param: num_cycles: number of search iterations
+        :param: patience: if set, stop early once the docked best score has not
+            improved for this many consecutive docks (plateau auto-stop)
         :return: a list of SMILES and scores
 
         Iterations are processed in batches of ``self.concurrency`` so docking
@@ -392,6 +394,9 @@ class ThompsonSampler:
         done = 0
         last_log = 0
         exhausted = False
+        # Measure the plateau window over search docks only, not warm-up.
+        if patience and hasattr(self.evaluator, "reset_plateau"):
+            self.evaluator.reset_plateau()
         pbar = tqdm(total=num_cycles, desc="Cycle", disable=self.hide_progress)
         while done < num_cycles and not exhausted:
             selections = []
@@ -412,6 +417,11 @@ class ThompsonSampler:
                 top_score, top_smiles, top_name = self._top_func(out_list)
                 self.logger.info(f"Iteration: {done} max score: {top_score:2f} smiles: {top_smiles} {top_name}")
                 last_log = done
+            if patience and getattr(self.evaluator, "docks_since_best", 0) >= patience:
+                self.logger.info(
+                    f"Auto-stop: no score improvement in {patience} docks (plateau) "
+                    f"after {done} search iterations.")
+                break
         pbar.close()
         return out_list
 
@@ -522,7 +532,7 @@ class ThompsonSampler:
             self._rws_sumw.append(sumw)
         return warmup_results
 
-    def search_rws(self, num_targets, min_cpds_per_core=50, stop=6000):
+    def search_rws(self, num_targets, min_cpds_per_core=50, stop=6000, patience=None):
         """RWS search with thermal cycling.
 
         Each cycle samples ``num_per_cycle`` reagents per component by roulette
@@ -556,6 +566,8 @@ class ThompsonSampler:
         n_resample = 0
         count = 0
 
+        if patience and hasattr(self.evaluator, "reset_plateau"):
+            self.evaluator.reset_plateau()
         pbar = tqdm(total=nsearch, desc="RWS search", disable=self.hide_progress)
         try:
             while len(uniq) < nsearch:
@@ -605,6 +617,11 @@ class ThompsonSampler:
                 pbar.update(min(len(pairs_u), nsearch - pbar.n))
                 pairs_u = []
                 count += 1
+                if patience and getattr(self.evaluator, "docks_since_best", 0) >= patience:
+                    self.logger.info(
+                        f"Auto-stop: no score improvement in {patience} docks (plateau) "
+                        f"after {len(uniq)} unique products.")
+                    break
                 if count % 100 == 0 and out_list:
                     top_score, top_smiles, top_name = (max(out_list) if scaling > 0 else min(out_list))
                     self.logger.info(f"RWS iteration {count}: best {top_score:.3f} {top_smiles} {top_name}")
