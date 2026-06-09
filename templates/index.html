@@ -251,7 +251,8 @@
     </div>
 
     <div class="panel" id="convPanel" style="display:none">
-      <h2>Convergence <span class="muted" id="convMeta" style="font-weight:400"></span></h2>
+      <h2>Convergence <span class="muted" id="convMeta" style="font-weight:400"></span>
+        <button class="h2btn" id="convToggle" type="button">hide chart</button></h2>
       <div id="convChart"></div>
     </div>
   </div>
@@ -454,6 +455,15 @@ logToggle.addEventListener('click', ()=>{
   const hidden = logEl.style.display==='none';
   logEl.style.display = hidden ? '' : 'none';
   logToggle.textContent = hidden ? 'hide console' : 'show console';
+});
+// Collapsible convergence chart (the panel header / meta stay visible). The
+// collapsed state survives live redraws since drawConvergence only touches the
+// chart's contents, not its display.
+const convToggle = document.getElementById('convToggle');
+convToggle.addEventListener('click', ()=>{
+  const hidden = convChart.style.display==='none';
+  convChart.style.display = hidden ? '' : 'none';
+  convToggle.textContent = hidden ? 'hide chart' : 'show chart';
 });
 
 // ---- Live progress bar + ETA ----
