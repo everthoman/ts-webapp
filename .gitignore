@@ -165,5 +165,7 @@ ts_webapp.out
 ts_webapp.log
 # Prepared-receptor bundles (binary, redundant with the unpacked .pdb/.sdf)
 data/*.zip
-# Annotated reagent table — regenerable from build_reagents.py + the .smi inputs
+# Annotated reagent artifacts — regenerable from build_reagents.py + functional_groups.json + the .smi inputs
 data/reagents_master.csv
+data/reagents_registry.csv
+data/reagents_index.json

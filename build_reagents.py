@@ -1,45 +1,51 @@
 #!/usr/bin/env python
-"""Build annotated reagent tables from a raw pool + ``reactions.json``.
+"""Tag a reagent pool against a functional-group vocabulary + ``reactions.json``.
 
-This is the *authoring* layer that compiles down to the per-component ``.smi``
-lists the Thompson Sampling sampler reads at run time. It classifies every
-reagent by:
+This is the *authoring* layer for the synthon-style model: a single reagent pool
+is tagged once against a shared functional-group vocabulary, and reactions
+reference those class names rather than curated per-reaction files — so adding a
+reaction (or swapping a 15K in-house pool for a 130K one) needs no reagent
+re-curation. See ``functional_groups.json`` for the vocabulary.
 
-* the reactive **handles** it carries (curated SMARTS — ``primary_amine``,
-  ``carboxylic_acid``, ``aryl_halide``, ``boronic`` …), and
+For every reagent it records:
+
+* the **functional-group tags** it carries (SMARTS match against the vocabulary,
+  e.g. ``primary_amine``, ``carboxylic_acid``, ``activated_aryl_halide``), and
 * which reaction **components** it can serve, *derived* by matching the
-  reaction's own reactant template (so the role columns can never drift out of
-  sync with ``reactions.json``).
+  reaction's own reactant template (so role columns can't drift from
+  ``reactions.json``).
 
-It then flags **difunctional** building blocks (carry >=2 orthogonal handle
-families — the ones that can sit *inside* a multi-step route, e.g. your
-amino-benzoic acids) and homo-difunctional **conflicts** (e.g. a di-amine,
-where it is ambiguous which end reacts), and emits:
+It flags **difunctional** building blocks (>=2 orthogonal handle families — the
+ones that can sit *inside* a multi-step route) and homo-difunctional
+**conflicts** (e.g. a di-amine), and emits:
 
-  1. a master CSV (one row per reagent) — the single source of truth; and
-  2. per-handle ``.smi`` *views*, and with ``--catalog-sets`` the exact
-     ``data/*.smi`` files ``reactions.json`` references — generated and
-     validated rather than hand-maintained.
+  1. a **tagged registry** (one row per block: stable id, SMILES, name, source,
+     price placeholder, fg_tags, …) — the single source of truth; and
+  2. an **inverted index** (class -> block ids) for O(1) per-component pruning at
+     route time.
+
+Optionally (``--master``) a detailed CSV with per-class counts and reaction-role
+columns, and (``--catalog-sets``) regenerated ``data/*.smi`` files.
 
 Multi-step "suitable for a 3-step order" is deliberately **not** baked in as a
 static column: it depends on the chosen reactions, their order and any
-protecting-group strategy, and a reagent's role flips with position (a
-Boc-amino-acid is a step-1 acid, then a step-2 amine once deprotected). We store
-the atomic facts (handles + difunctional class) and let the route logic /
-``/extend-options`` chain-rate preflight combine them per actual route.
+protecting-group strategy. We store the atomic facts (tags + difunctional class)
+and let the route logic / ``/extend-options`` chain-rate preflight combine them
+per actual route.
 
 Usage
 -----
     conda activate ts_gnina
-    # annotate a raw pool -> master CSV + per-handle view files
-    python build_reagents.py pool.smi -o data --master data/reagents_master.csv
-    # also regenerate the catalog's data/*.smi from the pool
-    python build_reagents.py pool*.smi -o data --catalog-sets
+    # tag a pool -> registry + inverted index
+    python build_reagents.py inhouse.smi --source inhouse -o data
+    # also emit the detailed master table and regenerate catalog .smi
+    python build_reagents.py pool*.smi --master data/reagents_master.csv --catalog-sets
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import sys
@@ -53,73 +59,18 @@ from rdkit.Chem import AllChem, Crippen, Descriptors
 RDLogger.DisableLog("rdApp.*")  # silence per-molecule parse warnings
 
 BASE_DIR = Path(__file__).resolve().parent
+DEFAULT_VOCAB = BASE_DIR / "functional_groups.json"
 
-# ---------------------------------------------------------------------------
-# Reactive-handle definitions (curated). These mirror the reactant patterns in
-# reactions.json but are deduped to chemistry-level groups, plus a couple the
-# reaction SMARTS are deliberately permissive about and must be *curated*:
-# `activated_aryl_halide` is the classic case — SNAr's template matches any
-# aryl-Cl/F, but only EWG-activated ones actually react.
-# ---------------------------------------------------------------------------
-# Electron-withdrawing substituent (recursive, as seen from the ring carbon it
-# hangs off): nitro, nitrile, any carbonyl carbon, sulfonyl, or CF3.
-_EWG = ("$([NX3+](=O)[O-]),$([NX3](=O)=O),$([CX2]#[NX1]),"
-        "$([CX3]=[OX1]),$([SX4](=O)(=O)),$([CX4](F)(F)F)")
-
-HANDLE_SMARTS: Dict[str, str] = {
-    "primary_amine":   "[NX3;H2;!$([NX3]C=O);!$([NX3]=*);!$([NX3]S(=O)=O)][#6]",
-    "secondary_amine": "[NX3;H1;!$([NX3]C=O);!$([NX3]=*);!$([NX3]S(=O)=O)]([#6])[#6]",
-    "carboxylic_acid": "[CX3](=O)[OX2H1]",
-    "aryl_halide":     "[c][F,Cl,Br,I]",
-    # SNAr-competent aryl-F/Cl: a fluoride/chloride on an aromatic ring that is
-    # ortho/meta/para to a strong EWG (benzene) or to a ring nitrogen (azine).
-    # Tuned to the curated activated_aryl_halides_100 set: 100/100 recall, the
-    # only "false positives" on the Suzuki set being 2-fluoropyridines that are
-    # genuinely activated (they just also carry a Br). NOTE: this includes the
-    # *meta* relationship because the curated set does; meta is only weakly
-    # activating, so on a raw pool drop the two meta branches for stricter
-    # precision (ortho/para only).
-    "activated_aryl_halide": (
-        f"[F,Cl;"
-        f"$([F,Cl][c]:[c][{_EWG}]),"                       # ortho to EWG
-        f"$([F,Cl][c]1[c][c]([{_EWG}])[c][c][c]1),"        # meta to EWG
-        f"$([F,Cl][c]1[c][c][c]([{_EWG}])[c][c]1),"        # para to EWG
-        f"$([F,Cl][c]:[n]),"                               # ortho to ring N
-        f"$([F,Cl][c]1[c,n][n][c,n][c,n][c,n]1),"          # meta to ring N
-        f"$([F,Cl][c]1[c,n][c,n][n][c,n][c,n]1)]"          # para to ring N
-    ),
-    "boronic":         "[#6][BX3]([OX2])[OX2]",
-    "aldehyde":        "[CX3H1](=O)[#6]",
-    "ketone":          "[#6][CX3](=O)[#6]",
-}
-
-# Handle -> family. Difunctionality / conflicts are judged per family so that an
-# amino-acid (amine + acid = two families) reads as a chainable linker, while a
-# di-amine (two of one family) reads as an ambiguous conflict.
-HANDLE_FAMILY: Dict[str, str] = {
-    "primary_amine": "amine",
-    "secondary_amine": "amine",
-    "carboxylic_acid": "acid",
-    "aryl_halide": "aryl_halide",
-    "boronic": "boronic",
-    "aldehyde": "carbonyl",
-    "ketone": "carbonyl",
-}
-
-# Refinement handles are *subsets* of a counted handle (an activated aryl halide
-# is also an aryl halide), so they're recorded as tags but excluded from the
-# family tally — otherwise one halide would double-count as a false conflict.
-REFINEMENT_HANDLES = {"activated_aryl_halide"}
-
-# ---------------------------------------------------------------------------
-# Catalog set specs: how to regenerate each data/*.smi from the annotated pool.
-# `require` / `exclude` are handle names; `aromatic_acid` requires the acid to
-# sit on an aromatic ring (benzoic). `limit` truncates (the _100/_500 variants
-# are just the head of the full list, matching the current catalog). This is the
-# bit that turns the catalog from hand-maintained into generated.
-# ---------------------------------------------------------------------------
+# Used by the catalog-set specs to tell an aromatic (benzoic) acid from an
+# aliphatic one — a curation detail, not a vocabulary class.
 AROMATIC_ACID = Chem.MolFromSmarts("[c][CX3](=O)[OX2H1]")
 
+# ---------------------------------------------------------------------------
+# Catalog set specs: how to regenerate each data/*.smi from the tagged pool.
+# `require` / `exclude` are class names; `aromatic_acid` requires the acid on an
+# aromatic ring; `limit` truncates (the _100/_500 variants are just the head).
+# This turns the catalog from hand-maintained into generated.
+# ---------------------------------------------------------------------------
 CATALOG_SETS: Dict[str, dict] = {
     "primary_amines_ok":          {"require": ["primary_amine"], "exclude": ["carboxylic_acid"], "no_conflict": True},
     "primary_amines_500":         {"like": "primary_amines_ok", "limit": 500},
@@ -136,18 +87,47 @@ CATALOG_SETS: Dict[str, dict] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Functional-group vocabulary
+# ---------------------------------------------------------------------------
+class Vocab:
+    """The functional-group vocabulary loaded from functional_groups.json.
+
+    Holds, per class: a compiled SMARTS query, its family (for the
+    difunctional/conflict tally) and whether it is a *refinement* (a subset of a
+    parent class, e.g. activated aryl halide ⊂ aryl halide) — refinements are
+    tags but are excluded from the family tally so they don't double-count.
+    """
+
+    def __init__(self, path: Path):
+        doc = json.loads(Path(path).read_text())
+        self.version = doc.get("version")
+        self.groups = doc["groups"]
+        self.query: Dict[str, Chem.Mol] = {}
+        self.family: Dict[str, str] = {}
+        self.refinement: set = set()
+        for name, g in self.groups.items():
+            q = Chem.MolFromSmarts(g["smarts"])
+            if q is None:
+                raise ValueError(f"Bad SMARTS for functional group {name!r}: {g['smarts']}")
+            self.query[name] = q
+            self.family[name] = g.get("family", name)
+            if g.get("refinement"):
+                self.refinement.add(name)
+
+    @property
+    def names(self) -> List[str]:
+        return list(self.query)
+
+
 def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
 
 
-def compile_handles() -> Dict[str, Chem.Mol]:
-    out = {}
-    for name, sm in HANDLE_SMARTS.items():
-        q = Chem.MolFromSmarts(sm)
-        if q is None:
-            raise ValueError(f"Bad handle SMARTS for {name!r}: {sm}")
-        out[name] = q
-    return out
+def bb_id(canonical_smiles: str) -> str:
+    """Stable, content-addressed building-block id (so pools merge/dedupe cleanly
+    across runs and sources)."""
+    return "BB" + hashlib.sha1(canonical_smiles.encode()).hexdigest()[:10]
 
 
 def reaction_component_queries(reactions: List[dict]) -> List[Tuple[str, str, Chem.Mol]]:
@@ -204,43 +184,79 @@ def read_pool(paths: List[Path]) -> List[Tuple[str, str]]:
     return list(seen.items())
 
 
-def classify(smiles: str, handles: Dict[str, Chem.Mol],
+def classify(smiles: str, vocab: Vocab,
              role_cols: List[Tuple[str, str, Chem.Mol]]) -> Optional[dict]:
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return None
-    # Handle counts (number of matches, so we can spot homo-difunctional cases).
-    counts = {h: len(mol.GetSubstructMatches(q)) for h, q in handles.items()}
-    present = [h for h, c in counts.items() if c]
+    # Per-class match counts (so we can spot homo-difunctional cases).
+    counts = {name: len(mol.GetSubstructMatches(q)) for name, q in vocab.query.items()}
+    present = [name for name, c in counts.items() if c]
     fam_counts: Counter = Counter()
-    for h in present:
-        if h in REFINEMENT_HANDLES:
-            continue
-        fam_counts[HANDLE_FAMILY[h]] += counts[h]
+    for name in present:
+        if name in vocab.refinement:
+            continue  # refinements are subsets of their parent; don't double-count
+        fam_counts[vocab.family[name]] += counts[name]
     families = sorted(fam_counts)
     difunctional = len(families) >= 2
     conflict = any(v > 1 for v in fam_counts.values())
     roles = {col: int(mol.HasSubstructMatch(tmpl)) for _rid, col, tmpl in role_cols}
     return {
+        "id": bb_id(smiles),
         "SMILES": smiles,
         "MW": round(Descriptors.MolWt(mol), 1),
         "logP": round(Crippen.MolLogP(mol), 2),
-        "handles": ";".join(present),
+        "fg_tags": ";".join(present),
         "families": ";".join(families),
         "n_families": len(families),
         "difunctional": int(difunctional),
         "conflict": int(conflict),
         "aromatic_acid": int(mol.HasSubstructMatch(AROMATIC_ACID)),
-        **{h: counts[h] for h in handles},
+        **{name: counts[name] for name in vocab.names},
         **roles,
     }
 
 
-def write_master(rows: List[dict], handles, role_cols, path: Path) -> None:
+def write_registry(rows: List[dict], path: Path) -> None:
+    """The tagged registry — the per-block source of truth. `price` is a
+    placeholder column now so cost can be folded in later without a schema
+    change (product cost = sum of block prices + optional per-step cost)."""
+    fields = ["id", "SMILES", "name", "source", "price", "MW", "logP",
+              "fg_tags", "families", "n_families", "difunctional", "conflict"]
+    with open(path, "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+    print(f"Wrote registry: {path}  ({len(rows)} blocks)")
+
+
+def build_index(rows: List[dict], vocab: Vocab) -> dict:
+    """Inverted index class -> [block ids] for O(1) per-component pruning, plus a
+    difunctional id list for internal-junction reasoning."""
+    by_class: Dict[str, List[str]] = {name: [] for name in vocab.names}
+    difunctional: List[str] = []
+    for r in rows:
+        for name in vocab.names:
+            if r[name] > 0:
+                by_class[name].append(r["id"])
+        if r["difunctional"]:
+            difunctional.append(r["id"])
+    return {
+        "version": 1,
+        "vocab_version": vocab.version,
+        "n_reagents": len(rows),
+        "counts": {name: len(ids) for name, ids in by_class.items()},
+        "by_class": by_class,
+        "difunctional": difunctional,
+    }
+
+
+def write_master(rows: List[dict], vocab: Vocab, role_cols, path: Path) -> None:
     role_names = [c for _rid, c, _q in role_cols]
-    fields = (["name", "SMILES", "MW", "logP", "handles", "families", "n_families",
-               "difunctional", "conflict", "aromatic_acid"]
-              + list(handles) + role_names)
+    fields = (["id", "name", "source", "price", "SMILES", "MW", "logP", "fg_tags",
+               "families", "n_families", "difunctional", "conflict", "aromatic_acid"]
+              + vocab.names + role_names)
     with open(path, "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
@@ -251,8 +267,7 @@ def write_master(rows: List[dict], handles, role_cols, path: Path) -> None:
 
 def select_set(rows: List[dict], spec: dict, resolved: Dict[str, List[dict]]) -> List[dict]:
     if "like" in spec:
-        base = resolved[spec["like"]]
-        out = base
+        out = resolved[spec["like"]]
     else:
         require = spec.get("require", [])
         exclude = spec.get("exclude", [])
@@ -285,44 +300,57 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("pool", nargs="+", help="raw reagent .smi file(s) ('SMILES name' per line)")
     ap.add_argument("-r", "--reactions", default=str(BASE_DIR / "reactions.json"))
+    ap.add_argument("-g", "--vocab", default=str(DEFAULT_VOCAB), help="functional-group vocabulary JSON")
     ap.add_argument("-o", "--out-dir", default=str(BASE_DIR / "data"))
-    ap.add_argument("--master", default=None, help="master CSV path (default: <out-dir>/reagents_master.csv)")
-    ap.add_argument("--views", action="store_true", help="also emit per-handle gen_<handle>.smi views")
+    ap.add_argument("--source", default="inhouse", help="provenance tag for these blocks (e.g. inhouse, enamine)")
+    ap.add_argument("--registry", default=None, help="registry CSV (default: <out-dir>/reagents_registry.csv)")
+    ap.add_argument("--index", default=None, help="inverted-index JSON (default: <out-dir>/reagents_index.json)")
+    ap.add_argument("--master", default=None, help="also write a detailed master CSV (per-class counts + role columns)")
+    ap.add_argument("--views", action="store_true", help="also emit per-class gen_<class>.smi views")
     ap.add_argument("--catalog-sets", action="store_true",
                     help="regenerate the data/*.smi files reactions.json references")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    master_path = Path(args.master) if args.master else out_dir / "reagents_master.csv"
+    registry_path = Path(args.registry) if args.registry else out_dir / "reagents_registry.csv"
+    index_path = Path(args.index) if args.index else out_dir / "reagents_index.json"
 
     catalog = json.loads(Path(args.reactions).read_text())
-    handles = compile_handles()
+    vocab = Vocab(Path(args.vocab))
     role_cols = reaction_component_queries(catalog["reactions"])
+    print(f"Vocabulary: {len(vocab.names)} classes (v{vocab.version}) from {args.vocab}", file=sys.stderr)
 
     pool = read_pool([Path(p) for p in args.pool])
     rows: List[dict] = []
     for smi, name in pool:
-        rec = classify(smi, handles, role_cols)
+        rec = classify(smi, vocab, role_cols)
         if rec is not None:
             rec["name"] = name
+            rec["source"] = args.source
+            rec["price"] = ""  # filled in later; product cost = sum of block prices
             rows.append(rec)
 
-    write_master(rows, handles, role_cols, master_path)
+    write_registry(rows, registry_path)
+    index = build_index(rows, vocab)
+    index_path.write_text(json.dumps(index, indent=2) + "\n")
+    print(f"Wrote inverted index: {index_path}")
 
-    # Summary by handle.
-    print("\nHandle inventory:")
-    for h in handles:
-        print(f"  {h:24s} {sum(1 for r in rows if r[h] > 0):6d}")
+    # Summary by class.
+    print("\nFunctional-group inventory:")
+    for name in vocab.names:
+        print(f"  {name:24s} {index['counts'][name]:6d}")
     print(f"  {'difunctional':24s} {sum(r['difunctional'] for r in rows):6d}")
     print(f"  {'conflict (homo-difunc)':24s} {sum(r['conflict'] for r in rows):6d}")
 
+    if args.master:
+        write_master(rows, vocab, role_cols, Path(args.master))
+
     if args.views:
-        for h in handles:
-            sel = [r for r in rows if r[h] > 0]
-            write_smi(sel, out_dir / f"gen_{h}.smi")
+        for name in vocab.names:
+            write_smi([r for r in rows if r[name] > 0], out_dir / f"gen_{name}.smi")
         write_smi([r for r in rows if r["difunctional"]], out_dir / "gen_difunctional.smi")
-        print("Wrote per-handle view files (gen_*.smi).")
+        print("Wrote per-class view files (gen_*.smi).")
 
     if args.catalog_sets:
         print("\nRegenerating catalog sets:")
@@ -331,8 +359,7 @@ def main() -> None:
             sel = select_set(rows, spec, resolved)
             resolved[set_id] = sel
             fname = catalog["reagent_sets"].get(set_id, {}).get("file", f"data/{set_id}.smi")
-            path = BASE_DIR / fname
-            write_smi(sel, path)
+            write_smi(sel, BASE_DIR / fname)
             print(f"  {set_id:30s} {len(sel):6d} -> {fname}")
 
 

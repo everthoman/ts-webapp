@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "_comment": "Functional-group vocabulary: reactions reference these class names; reagents are tagged by SMARTS match. 'refinement' classes are subsets of 'parent' and are excluded from the difunctional/conflict family tally.",
+  "groups": {
+    "primary_amine": {
+      "smarts": "[NX3;H2;!$([NX3]C=O);!$([NX3]=*);!$([NX3]S(=O)=O)][#6]",
+      "label": "Primary amine",
+      "family": "amine"
+    },
+    "secondary_amine": {
+      "smarts": "[NX3;H1;!$([NX3]C=O);!$([NX3]=*);!$([NX3]S(=O)=O)]([#6])[#6]",
+      "label": "Secondary amine",
+      "family": "amine"
+    },
+    "carboxylic_acid": {
+      "smarts": "[CX3](=O)[OX2H1]",
+      "label": "Carboxylic acid",
+      "family": "acid"
+    },
+    "aryl_halide": {
+      "smarts": "[c][F,Cl,Br,I]",
+      "label": "Aryl/heteroaryl halide",
+      "family": "aryl_halide"
+    },
+    "activated_aryl_halide": {
+      "smarts": "[F,Cl;$([F,Cl][c]:[c][$([NX3+](=O)[O-]),$([NX3](=O)=O),$([CX2]#[NX1]),$([CX3]=[OX1]),$([SX4](=O)(=O)),$([CX4](F)(F)F)]),$([F,Cl][c]1[c][c]([$([NX3+](=O)[O-]),$([NX3](=O)=O),$([CX2]#[NX1]),$([CX3]=[OX1]),$([SX4](=O)(=O)),$([CX4](F)(F)F)])[c][c][c]1),$([F,Cl][c]1[c][c][c]([$([NX3+](=O)[O-]),$([NX3](=O)=O),$([CX2]#[NX1]),$([CX3]=[OX1]),$([SX4](=O)(=O)),$([CX4](F)(F)F)])[c][c]1),$([F,Cl][c]:[n]),$([F,Cl][c]1[c,n][n][c,n][c,n][c,n]1),$([F,Cl][c]1[c,n][c,n][n][c,n][c,n]1)]",
+      "label": "Activated aryl halide (SNAr)",
+      "family": "aryl_halide",
+      "refinement": true,
+      "parent": "aryl_halide"
+    },
+    "boronic": {
+      "smarts": "[#6][BX3]([OX2])[OX2]",
+      "label": "Aryl boronic acid/ester",
+      "family": "boronic"
+    },
+    "aldehyde": {
+      "smarts": "[CX3H1](=O)[#6]",
+      "label": "Aldehyde",
+      "family": "carbonyl"
+    },
+    "ketone": {
+      "smarts": "[#6][CX3](=O)[#6]",
+      "label": "Ketone",
+      "family": "carbonyl"
+    }
+  }
+}
