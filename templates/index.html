@@ -779,6 +779,11 @@ function attachStream(id){
     ev.close();
     stopLiveTop();
     stopProgress();
+    // The last poll fired while still 'running' (bar short, ETA shown); the
+    // timer is now cleared so no poll will catch the terminal status. Finalize
+    // the bar here so a finished run reads 100% with no stale ETA.
+    progBar.style.width='100%';
+    progText.textContent = progText.textContent.replace(/ · ETA .*/, '');
     stopConvergence();
     loadConvergence(id);
     setStatus(e.data);
