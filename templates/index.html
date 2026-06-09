@@ -102,6 +102,14 @@
     <div class="panel">
       <h2>1 &middot; Reaction route</h2>
       <div class="muted">Step 1 is a starting reaction; further steps react the running intermediate with one more reagent set. Only the final product is docked.</div>
+      <div id="sourceRow" class="checkline" style="display:none;margin-top:8px">
+        <label style="margin:0">Reagents</label>
+        <select id="reagentSource" style="width:auto">
+          <option value="sets">Curated sets</option>
+          <option value="pool">Master pool (auto-prune)</option>
+        </select>
+        <span class="muted" id="poolInfo"></span>
+      </div>
       <div id="steps"></div>
       <div class="row" style="margin-top:8px">
         <button class="btn ghost" id="addStep" type="button">+ Add extension step</button>
@@ -281,8 +289,16 @@
 <script>
 const CATALOG = __CATALOG_JSON__;
 const GNINA_OK = __GNINA_OK__;
+const POOL = __POOL_JSON__;   // {available, size, counts} — synthon master pool
 const startReactions  = CATALOG.reactions.filter(r => r.role === 'start');
 const extendReactions = CATALOG.reactions.filter(r => r.role === 'extend');
+
+// "sets" = curated per-reaction files; "pool" = prune the master pool by the
+// fg classes each component accepts. Pool mode only offered if a pool is loaded.
+function reagentSourceVal(){
+  return POOL.available ? document.getElementById('reagentSource').value : 'sets';
+}
+let poolLib = 0, poolReagentTotal = 0;  // last /candidates product + sum (pool mode cost note)
 
 // ---- Light / dark theme toggle (persisted; head script applies it pre-paint) ----
 const themeToggle = document.getElementById('themeToggle');
@@ -303,12 +319,20 @@ function setOptions(sel, ids, sets){
 }
 
 function reagentRowsFor(reaction, stepIdx){
-  // one <select> per component
+  // one <select> per component (curated sets)
   return reaction.components.map((c, ci) => `
     <label style="margin-top:8px">${c.label}</label>
     <select data-step="${stepIdx}" class="reagentSel">
       ${c.sets.map(s => `<option value="${s}">${CATALOG.reagent_sets[s].label}</option>`).join('')}
     </select>`).join('');
+}
+
+function poolRowsFor(reaction, stepIdx){
+  // pool mode: no per-component picker — show the live candidate count for the
+  // classes each component accepts (filled by updateCandidates()).
+  return reaction.components.map((c, ci) => `
+    <label style="margin-top:8px">${c.label} <span class="chip">(${(c.accepts||[]).join(' / ')})</span></label>
+    <div class="poolcand muted" data-step="${stepIdx}" data-comp="${ci}">… candidates from pool</div>`).join('');
 }
 
 function makeStep(idx){
@@ -332,9 +356,12 @@ function makeStep(idx){
   const reagentsDiv = div.querySelector('.reagents');
   function refresh(){
     const r = CATALOG.reactions.find(x => x.id === rxnSel.value);
-    reagentsDiv.innerHTML = reagentRowsFor(r, idx);
+    const pool = reagentSourceVal() === 'pool';
+    reagentsDiv.innerHTML = pool ? poolRowsFor(r, idx) : reagentRowsFor(r, idx);
     updateCost();
+    if (pool) scheduleCandidates();
   }
+  div._refresh = refresh;           // so a source-toggle can re-render this step
   rxnSel.addEventListener('change', refresh);
   refresh();
   const rm = div.querySelector('.removeStep');
@@ -355,7 +382,7 @@ stepsDiv.appendChild(makeStep(0));
 document.getElementById('addStep').addEventListener('click', ()=>{
   if (!extendReactions.length){ alert('No extension reactions defined in reactions.json'); return; }
   stepsDiv.appendChild(makeStep(document.querySelectorAll('#steps .step').length));
-  scheduleAnnotate();
+  if (reagentSourceVal() === 'pool') scheduleCandidates(); else scheduleAnnotate();
 });
 
 // ---- Reagent-aware extend-reaction compatibility ----
@@ -397,9 +424,46 @@ function annotateAllExtendSteps(){
   [...document.querySelectorAll('#steps .step')].forEach((s,i)=>{ if (i>0) annotateExtendStep(s,i); });
 }
 
-// Any upstream reaction/reagent change can shift the chain rates downstream.
+// ---- Master-pool candidate counts (pool mode) ----
+// Ask the server how many pool reagents each component accepts and fill the
+// per-component count cells + the cost note's library size.
+let candTimer = null;
+function scheduleCandidates(){ clearTimeout(candTimer); candTimer = setTimeout(updateCandidates, 300); }
+async function updateCandidates(){
+  if (reagentSourceVal() !== 'pool') return;
+  let data;
+  try {
+    const fd = new FormData(); fd.append('config', JSON.stringify({steps: collectSteps()}));
+    data = await (await fetch('/candidates',{method:'POST',body:fd})).json();
+  } catch(e){ return; }
+  if (!data.pool_available || !data.components) return;
+  // Cells and data.components are both ordered steps-then-components, so align.
+  const cells = [...document.querySelectorAll('#steps .poolcand')];
+  cells.forEach((cell,i)=>{
+    const c = data.components[i];
+    if (c) cell.textContent = `${c.count.toLocaleString()} candidates` + (c.count ? '' : ' — none match!');
+    if (c) cell.className = 'poolcand muted' + (c.count ? '' : ' bad');
+  });
+  poolLib = data.library_size; poolReagentTotal = data.components.reduce((a,c)=>a+c.count,0);
+  updateCost();
+}
+function rerenderAllSteps(){ [...document.querySelectorAll('#steps .step')].forEach(s=> s._refresh && s._refresh()); }
+
+if (POOL.available){
+  document.getElementById('sourceRow').style.display = '';
+  document.getElementById('poolInfo').textContent = `pool: ${(POOL.size||0).toLocaleString()} blocks tagged`;
+  document.getElementById('reagentSource').addEventListener('change', ()=>{
+    rerenderAllSteps(); updateCost();
+    if (reagentSourceVal() === 'pool') scheduleCandidates(); else scheduleAnnotate();
+  });
+}
+
+// Any upstream reaction/reagent change can shift chain rates / candidate counts.
 stepsDiv.addEventListener('change', e=>{
-  if (e.target.matches('.reactionSel, .reagentSel')){ updateCost(); scheduleAnnotate(); }
+  if (e.target.matches('.reactionSel, .reagentSel')){
+    updateCost();
+    if (reagentSourceVal() === 'pool') scheduleCandidates(); else scheduleAnnotate();
+  }
 });
 
 document.getElementById('bsMode').addEventListener('change', e=>{
@@ -433,11 +497,13 @@ function fmtBig(n){
 function updateCost(){
   const warm = parseInt(document.getElementById('warmup').value||'0');
   const iters = parseInt(document.getElementById('iters').value||'0');
-  const rc = reagentCount();
+  const pool = reagentSourceVal() === 'pool';
+  const rc = pool ? poolReagentTotal : reagentCount();
+  const lib = pool ? poolLib : librarySize();
   const est = rc*warm + iters;
   const label = document.getElementById('method').value === 'rws' ? 'RWS search target' : 'search iterations';
   document.getElementById('costNote').textContent =
-    `Full combinatorial library ≈ ${fmtBig(librarySize())} products (product of component counts; ` +
+    `Full combinatorial library ≈ ${fmtBig(lib)} products (product of component counts; ` +
     `multi-step is an upper bound — see Check filters for the build rate). ` +
     `≈ up to ${est.toLocaleString()} docking calls (warm-up ${rc}×${warm} + ${iters} ${label}). ` +
     `Repeated products are cached. Start small — docking dominates runtime.`;
@@ -460,6 +526,7 @@ function buildConfig(){
   const numOrNull = el => el.value==='' ? null : parseFloat(el.value);
   return {
     session_name: sessionName.value.trim() || null,
+    reagent_source: reagentSourceVal(),
     steps: collectSteps(),
     binding_site: binding,
     gnina: {

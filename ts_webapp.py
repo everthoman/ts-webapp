@@ -53,6 +53,56 @@ with open(BASE_DIR / "reactions.json") as fh:
 REAGENT_SETS = CATALOG["reagent_sets"]
 REACTIONS = {r["id"]: r for r in CATALOG["reactions"]}
 
+# ---------------------------------------------------------------------------
+# Reagent pool (synthon model). One tagged master pool + an inverted index
+# (class -> block ids), produced by build_reagents.py. When present it enables
+# "Master pool (auto-prune)" mode: instead of picking curated set files, each
+# reaction component draws live from the pool by the functional-group classes it
+# accepts. The curated-set path is unchanged; pool mode is purely additive.
+# ---------------------------------------------------------------------------
+REGISTRY_CSV = BASE_DIR / "data" / "reagents_registry.csv"
+INDEX_JSON = BASE_DIR / "data" / "reagents_index.json"
+POOL: Dict[str, dict] = {}            # block id -> {"smiles", "name", "conflict"}
+POOL_BY_CLASS: Dict[str, list] = {}   # fg class -> [block ids]
+POOL_META: dict = {}
+
+
+def _load_pool() -> None:
+    """Load the tagged registry + inverted index if present (best-effort)."""
+    global POOL, POOL_BY_CLASS, POOL_META
+    POOL, POOL_BY_CLASS, POOL_META = {}, {}, {}
+    if not (REGISTRY_CSV.is_file() and INDEX_JSON.is_file()):
+        return
+    try:
+        df = pd.read_csv(REGISTRY_CSV, dtype=str).fillna("")
+        for r in df.itertuples(index=False):
+            POOL[r.id] = {"smiles": r.SMILES, "name": r.name or r.id,
+                          "conflict": str(r.conflict) in ("1", "1.0", "True")}
+        idx = json.loads(INDEX_JSON.read_text())
+        POOL_BY_CLASS = idx.get("by_class", {})
+        POOL_META = {"n_reagents": idx.get("n_reagents"),
+                     "counts": idx.get("counts", {}),
+                     "vocab_version": idx.get("vocab_version")}
+    except Exception:
+        logging.getLogger("ts_webapp").exception("Failed to load reagent pool")
+        POOL, POOL_BY_CLASS, POOL_META = {}, {}, {}
+
+
+_load_pool()
+
+
+def _pool_candidates(accepts: List[str]) -> List[str]:
+    """Block ids matching any of the accepted fg classes (deduped, order-stable)."""
+    ids: List[str] = []
+    seen = set()
+    for cls in accepts:
+        for i in POOL_BY_CLASS.get(cls, ()):
+            if i not in seen:
+                seen.add(i)
+                ids.append(i)
+    return ids
+
+
 # Docking is GPU- and disk-cwd-bound; run one TS job at a time.
 _JOB_LOCK = threading.Lock()
 
@@ -233,6 +283,48 @@ def _build_route(steps_cfg: List[dict]):
         summary.append(
             f"Step {i+1}: {rxn['name']} [{', '.join(REAGENT_SETS[s]['label'] for s in chosen)}]"
         )
+    return reagent_file_list, route_steps, summary
+
+
+def _build_route_pool(steps_cfg: List[dict], work_dir: Path):
+    """Pool-mode route: prune the master pool per component by the classes each
+    reaction component accepts, writing a per-component .smi into ``work_dir`` so
+    the sampler reads it like any other reagent file. Returns the same tuple as
+    :func:`_build_route`."""
+    if not steps_cfg:
+        raise HTTPException(400, "No reaction steps selected")
+    if not POOL:
+        raise HTTPException(
+            400, "No reagent pool loaded — run build_reagents.py to create "
+                 "data/reagents_registry.csv + reagents_index.json")
+    reagent_file_list: List[str] = []
+    route_steps = []
+    summary = []
+    for i, step in enumerate(steps_cfg):
+        rid = step.get("reaction_id")
+        rxn = REACTIONS.get(rid)
+        if rxn is None:
+            raise HTTPException(400, f"Unknown reaction: {rid}")
+        if i == 0 and rxn.get("role") != "start":
+            raise HTTPException(400, f"Step 1 must be a 'start' reaction, got '{rid}'")
+        if i > 0 and rxn.get("role") != "extend":
+            raise HTTPException(400, f"Step {i+1} must be an 'extend' reaction, got '{rid}'")
+        labels = []
+        for j, comp in enumerate(rxn["components"]):
+            accepts = comp.get("accepts", [])
+            ids = _pool_candidates(accepts)
+            if not ids:
+                raise HTTPException(
+                    400, f"No pool reagents match {comp['label']} "
+                         f"({'/'.join(accepts) or 'no classes'}) for reaction '{rid}'")
+            path = work_dir / f"pool_s{i}_c{j}.smi"
+            with open(path, "w") as fh:
+                for k in ids:
+                    fh.write(f"{POOL[k]['smiles']} {POOL[k]['name']}\n")
+            reagent_file_list.append(str(path))
+            labels.append(f"{comp['label']} [{len(ids)} from pool]")
+        route_steps.append((rxn["smarts"], len(rxn["components"])))
+        summary.append(f"Step {i+1}: {rxn['name']} [{', '.join(labels)}]")
     return reagent_file_list, route_steps, summary
 
 
@@ -579,10 +671,13 @@ def _redock_job(job: Job, cfg: dict, rows: List[tuple], params: dict):
 @app.get("/", response_class=HTMLResponse)
 async def index():
     gnina_ok = os.path.exists(GNINA_PATH) or shutil.which("gnina") is not None
+    pool_info = {"available": bool(POOL), "size": POOL_META.get("n_reagents"),
+                 "counts": POOL_META.get("counts", {})}
     html = (
         INDEX_HTML
         .replace("__CATALOG_JSON__", json.dumps(CATALOG))
         .replace("__GNINA_OK__", "true" if gnina_ok else "false")
+        .replace("__POOL_JSON__", json.dumps(pool_info))
     )
     return HTMLResponse(html)
 
@@ -594,7 +689,11 @@ async def run(
     reference: Optional[UploadFile] = File(None),
 ):
     cfg = json.loads(config)
-    reagent_file_list, route_steps, summary = _build_route(cfg.get("steps", []))
+    source = cfg.get("reagent_source", "sets")
+    # Curated-set routes validate before any dir is created; pool routes need the
+    # job dir (they write per-component .smi into it), so they're built below.
+    if source != "pool":
+        reagent_file_list, route_steps, summary = _build_route(cfg.get("steps", []))
 
     # Optional human-readable session name. Re-running the same name overwrites
     # that session's previous results; a blank name falls back to a random id
@@ -610,6 +709,14 @@ async def run(
     job_dir.mkdir(parents=True, exist_ok=True)
     job = Job(id=job_id, dir=job_dir)
     JOBS[job_id] = job
+
+    if source == "pool":
+        try:
+            reagent_file_list, route_steps, summary = _build_route_pool(cfg.get("steps", []), job_dir)
+        except HTTPException:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            JOBS.pop(job_id, None)
+            raise
 
     # Save uploads
     with open(job_dir / "receptor.pdb", "wb") as f:
@@ -676,7 +783,9 @@ async def rerun(job_id: str):
     if live is not None and live.status in ("queued", "running"):
         raise HTTPException(409, f"'{job_id}' is already running")
 
-    reagent_file_list, route_steps, summary = _build_route(cfg.get("steps", []))
+    source = cfg.get("reagent_source", "sets")
+    if source != "pool":
+        reagent_file_list, route_steps, summary = _build_route(cfg.get("steps", []))
 
     # Preserve the uploaded receptor/reference across the in-place overwrite.
     has_ref = (src / "reference.sdf").is_file()
@@ -691,6 +800,9 @@ async def rerun(job_id: str):
         shutil.copy(tmp / "reference.sdf", src / "reference.sdf")
     shutil.rmtree(tmp, ignore_errors=True)
 
+    if source == "pool":  # pool routes write per-component .smi into the job dir
+        reagent_file_list, route_steps, summary = _build_route_pool(cfg.get("steps", []), src)
+
     job = Job(id=job_id, dir=src)
     JOBS[job_id] = job
     job.thread = threading.Thread(
@@ -700,12 +812,41 @@ async def rerun(job_id: str):
     return {"job_id": job_id}
 
 
+@app.post("/candidates")
+async def candidates(config: str = Form(...)):
+    """Pool-mode preview: for the chosen route, how many master-pool reagents
+    each component accepts, and the resulting combinatorial library size. Pure
+    lookups against the inverted index — fast enough to drive the route UI."""
+    cfg = json.loads(config)
+    if not POOL:
+        return {"pool_available": False}
+    comps = []
+    lib = 1
+    for i, step in enumerate(cfg.get("steps", [])):
+        rxn = REACTIONS.get(step.get("reaction_id"))
+        if rxn is None:
+            raise HTTPException(400, f"Unknown reaction: {step.get('reaction_id')}")
+        for comp in rxn["components"]:
+            accepts = comp.get("accepts", [])
+            n = len(_pool_candidates(accepts))
+            lib *= n
+            comps.append({"step": i + 1, "label": comp["label"],
+                          "accepts": accepts, "count": n})
+    return {"pool_available": True, "pool_size": POOL_META.get("n_reagents"),
+            "components": comps, "library_size": lib}
+
+
 @app.post("/preflight")
 async def preflight(config: str = Form(...)):
     """Sample random products and report filter pass-rate + MW/logP spread,
     so a too-tight filter is caught before committing to a full run."""
     cfg = json.loads(config)
-    reagent_file_list, route_steps, _summary = _build_route(cfg.get("steps", []))
+    pool_tmp = None
+    if cfg.get("reagent_source") == "pool":
+        pool_tmp = Path(tempfile.mkdtemp(prefix="ts_pf_"))
+        reagent_file_list, route_steps, _summary = _build_route_pool(cfg.get("steps", []), pool_tmp)
+    else:
+        reagent_file_list, route_steps, _summary = _build_route(cfg.get("steps", []))
     fcfg = cfg.get("filters", {})
     filters = MolFilters(
         use_pains=fcfg.get("pains", False),
@@ -716,6 +857,8 @@ async def preflight(config: str = Form(...)):
     sampler = RouteSampler(mode="minimize")
     sampler.read_reagents(reagent_file_list=reagent_file_list, num_to_select=None)
     sampler.set_route(route_steps)
+    if pool_tmp is not None:  # reagents are in memory now; drop the temp .smi
+        shutil.rmtree(pool_tmp, ignore_errors=True)
 
     n = 300
     built = 0
