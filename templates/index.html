@@ -110,6 +110,18 @@
         </select>
         <span class="muted" id="poolInfo"></span>
       </div>
+      <div id="growRow" class="checkline" style="margin-top:8px">
+        <label style="margin:0"><input type="checkbox" id="growMode"> Grow from a bound fragment</label>
+      </div>
+      <div id="growBox" style="display:none;margin:4px 0 2px;padding:8px;background:var(--inset-bg);border-radius:6px">
+        <div class="muted" style="margin-bottom:6px">The fragment is fixed at component&nbsp;1 of step&nbsp;1; only the building blocks vary. Upload the <b>bound fragment</b> (in its pose) as the reference ligand below — it is both the docking box and the pose anchor.</div>
+        <label>Fragment SMILES</label>
+        <input type="text" id="fragSmiles" placeholder="e.g. OC(=O)c1ccncc1">
+        <label style="margin-top:8px">Conserved core SMARTS <span class="muted">(the part that survives the reaction — exclude the reacting handle)</span></label>
+        <input type="text" id="fragCore" placeholder="e.g. c1ccncc1">
+        <label style="margin-top:8px">Max core drift (&Aring;)</label>
+        <input type="number" id="fragRmsd" value="1.5" step="0.1" min="0" style="width:auto">
+      </div>
       <div id="steps"></div>
       <div class="row" style="margin-top:8px">
         <button class="btn ghost" id="addStep" type="button">+ Add extension step</button>
@@ -126,7 +138,7 @@
         <option value="coords">XYZ coordinates + box</option>
       </select>
       <div id="bsReference">
-        <label>Reference ligand (SDF)</label>
+        <label id="refLabel">Reference ligand (SDF)</label>
         <input type="file" id="reference" accept=".sdf">
         <label>Autobox padding (&Aring;)</label>
         <input type="number" id="autoboxAdd" value="4" step="0.5">
@@ -298,6 +310,11 @@ const extendReactions = CATALOG.reactions.filter(r => r.role === 'extend');
 function reagentSourceVal(){
   return POOL.available ? document.getElementById('reagentSource').value : 'sets';
 }
+// Grow-from-fragment: the fixed fragment occupies component 1 of step 1. We mark
+// that slot with this sentinel in the steps config; the backend turns it into a
+// one-line .smi. Must match FRAGMENT_SENTINEL in ts_webapp.py.
+const FRAGMENT_SENTINEL = '__fragment__';
+function growEnabled(){ return document.getElementById('growMode').checked; }
 let poolLib = 0, poolReagentTotal = 0;  // last /candidates product + sum (pool mode cost note)
 
 // ---- Light / dark theme toggle (persisted; head script applies it pre-paint) ----
@@ -318,21 +335,49 @@ function setOptions(sel, ids, sets){
   sel.innerHTML = ids.map(id => `<option value="${id}">${sets[id].label}</option>`).join('');
 }
 
+// In grow mode the user picks which component of the start step the fixed
+// fragment occupies (so an acid / amine / halide fragment all work). The choice
+// is a per-component radio on step 1; default is the first component.
+function fragSlot(){
+  const r = document.querySelector('#steps .step input.fragRadio:checked');
+  return r ? parseInt(r.value) : 0;
+}
+function fragRadio(ci, fs){
+  return `<label style="font-weight:400;font-size:11px;margin-left:8px;margin-top:0">` +
+    `<input type="radio" class="fragRadio" name="fragSlot" value="${ci}" ${ci===fs?'checked':''}> fragment</label>`;
+}
+
 function reagentRowsFor(reaction, stepIdx){
-  // one <select> per component (curated sets)
-  return reaction.components.map((c, ci) => `
-    <label style="margin-top:8px">${c.label}</label>
-    <select data-step="${stepIdx}" class="reagentSel">
+  // one <select> per component (curated sets). In grow mode the chosen component
+  // of step 1 is the fixed fragment — render it as fixed, no picker.
+  const grow = growEnabled() && stepIdx===0;
+  const fs = grow ? Math.min(fragSlot(), reaction.components.length-1) : -1;
+  return reaction.components.map((c, ci) => {
+    const rad = grow ? fragRadio(ci, fs) : '';
+    if (grow && ci===fs)
+      return `<label style="margin-top:8px">${c.label} ${rad}</label>
+        <div class="poolcand muted">Fragment (fixed)</div>`;
+    return `<label style="margin-top:8px">${c.label} ${rad}</label>
+    <select data-step="${stepIdx}" data-comp="${ci}" class="reagentSel">
       ${c.sets.map(s => `<option value="${s}">${CATALOG.reagent_sets[s].label}</option>`).join('')}
-    </select>`).join('');
+    </select>`;
+  }).join('');
 }
 
 function poolRowsFor(reaction, stepIdx){
   // pool mode: no per-component picker — show the live candidate count for the
-  // classes each component accepts (filled by updateCandidates()).
-  return reaction.components.map((c, ci) => `
-    <label style="margin-top:8px">${c.label} <span class="chip">(${(c.accepts||[]).join(' / ')})</span></label>
-    <div class="poolcand muted" data-step="${stepIdx}" data-comp="${ci}">… candidates from pool</div>`).join('');
+  // classes each component accepts (filled by updateCandidates()). In grow mode
+  // the chosen component of step 1 is the fixed fragment.
+  const grow = growEnabled() && stepIdx===0;
+  const fs = grow ? Math.min(fragSlot(), reaction.components.length-1) : -1;
+  return reaction.components.map((c, ci) => {
+    const rad = grow ? fragRadio(ci, fs) : '';
+    if (grow && ci===fs)
+      return `<label style="margin-top:8px">${c.label} ${rad}</label>
+        <div class="poolcand muted">Fragment (fixed)</div>`;
+    return `<label style="margin-top:8px">${c.label} <span class="chip">(${(c.accepts||[]).join(' / ')})</span> ${rad}</label>
+    <div class="poolcand muted" data-step="${stepIdx}" data-comp="${ci}">… candidates from pool</div>`;
+  }).join('');
 }
 
 function makeStep(idx){
@@ -441,8 +486,10 @@ async function updateCandidates(){
   const cells = [...document.querySelectorAll('#steps .poolcand')];
   cells.forEach((cell,i)=>{
     const c = data.components[i];
-    if (c) cell.textContent = `${c.count.toLocaleString()} candidates` + (c.count ? '' : ' — none match!');
-    if (c) cell.className = 'poolcand muted' + (c.count ? '' : ' bad');
+    if (!c) return;
+    if (/fragment/i.test(c.label)){ cell.textContent = 'Fragment (fixed)'; cell.className = 'poolcand muted'; return; }
+    cell.textContent = `${c.count.toLocaleString()} candidates` + (c.count ? '' : ' — none match!');
+    cell.className = 'poolcand muted' + (c.count ? '' : ' bad');
   });
   poolLib = data.library_size; poolReagentTotal = data.components.reduce((a,c)=>a+c.count,0);
   updateCost();
@@ -460,6 +507,11 @@ if (POOL.available){
 
 // Any upstream reaction/reagent change can shift chain rates / candidate counts.
 stepsDiv.addEventListener('change', e=>{
+  if (e.target.matches('.fragRadio')){
+    rerenderAllSteps(); updateCost();
+    if (reagentSourceVal() === 'pool') scheduleCandidates();
+    return;
+  }
   if (e.target.matches('.reactionSel, .reagentSel')){
     updateCost();
     if (reagentSourceVal() === 'pool') scheduleCandidates(); else scheduleAnnotate();
@@ -472,22 +524,59 @@ document.getElementById('bsMode').addEventListener('change', e=>{
   document.getElementById('bsCoords').style.display = ref ? 'none' : '';
 });
 
+// Grow-from-fragment: reveal the fragment inputs, force reference (autobox)
+// mode (the bound fragment is the reference), and re-render the route so the
+// fragment slot shows as fixed.
+document.getElementById('growMode').addEventListener('change', e=>{
+  const on = e.target.checked;
+  document.getElementById('growBox').style.display = on ? '' : 'none';
+  document.getElementById('refLabel').textContent =
+    on ? 'Bound fragment (SDF, in its pose) — also the autobox reference' : 'Reference ligand (SDF)';
+  if (on){
+    const bs = document.getElementById('bsMode');
+    bs.value = 'reference';
+    bs.dispatchEvent(new Event('change'));
+  }
+  rerenderAllSteps();
+  updateCost();
+  if (reagentSourceVal()==='pool') scheduleCandidates();
+});
+
 function collectSteps(){
-  return [...document.querySelectorAll('#steps .step')].map(s => ({
-    reaction_id: s.querySelector('.reactionSel').value,
-    reagent_sets: [...s.querySelectorAll('.reagentSel')].map(sel => sel.value),
-  }));
+  const grow = growEnabled();
+  return [...document.querySelectorAll('#steps .step')].map((s, i) => {
+    const rid = s.querySelector('.reactionSel').value;
+    if (grow && i === 0){
+      // The fragment slot has no picker; reassemble the full component array
+      // with the sentinel at the chosen slot and the other components' values
+      // (curated: from selects; pool: empty -> pruned by accepts server-side).
+      const rxn = CATALOG.reactions.find(x => x.id === rid);
+      const ncomp = rxn ? rxn.components.length : 1;
+      const fs = Math.min(fragSlot(), ncomp - 1);
+      const byComp = {};
+      s.querySelectorAll('.reagentSel').forEach(sel => byComp[parseInt(sel.dataset.comp)] = sel.value);
+      const sets = [];
+      for (let ci = 0; ci < ncomp; ci++) sets.push(ci === fs ? FRAGMENT_SENTINEL : (byComp[ci] || ''));
+      return { reaction_id: rid, reagent_sets: sets };
+    }
+    return { reaction_id: rid, reagent_sets: [...s.querySelectorAll('.reagentSel')].map(sel => sel.value) };
+  });
 }
 
 function reagentCount(){
   let total = 0;
-  collectSteps().forEach(s => s.reagent_sets.forEach(id => total += CATALOG.reagent_sets[id].count));
+  collectSteps().forEach(s => s.reagent_sets.forEach(id => {
+    if (id !== FRAGMENT_SENTINEL) total += CATALOG.reagent_sets[id].count;
+  }));
   return total;
 }
-// Full combinatorial library = product of the per-component reagent counts.
+// Full combinatorial library = product of the per-component reagent counts
+// (the fixed fragment contributes a factor of 1).
 function librarySize(){
   let prod = 1;
-  collectSteps().forEach(s => s.reagent_sets.forEach(id => prod *= (CATALOG.reagent_sets[id].count||0)));
+  collectSteps().forEach(s => s.reagent_sets.forEach(id => {
+    prod *= (id === FRAGMENT_SENTINEL ? 1 : (CATALOG.reagent_sets[id].count||0));
+  }));
   return prod;
 }
 function fmtBig(n){
@@ -524,10 +613,18 @@ function buildConfig(){
         center:[parseFloat(cx.value),parseFloat(cy.value),parseFloat(cz.value)],
         box_size:parseFloat(boxSize.value) };
   const numOrNull = el => el.value==='' ? null : parseFloat(el.value);
+  const grow = growEnabled() ? {
+    enabled: true,
+    fragment_smiles: document.getElementById('fragSmiles').value.trim(),
+    core_smarts: document.getElementById('fragCore').value.trim() || null,
+    max_core_rmsd: parseFloat(document.getElementById('fragRmsd').value) || 1.5,
+    local_only: true,
+  } : { enabled: false };
   return {
     session_name: sessionName.value.trim() || null,
     reagent_source: reagentSourceVal(),
     steps: collectSteps(),
+    grow: grow,
     binding_site: binding,
     gnina: {
       score_field: scoreField.value,
@@ -848,6 +945,12 @@ document.getElementById('runBtn').addEventListener('click', async ()=>{
   const bsMode = document.getElementById('bsMode').value;
   const refEl = document.getElementById('reference');
   if (bsMode==='reference' && !refEl.files.length){ alert('Upload a reference ligand SDF (autobox mode).'); return; }
+  if (growEnabled()){
+    if (!document.getElementById('fragSmiles').value.trim()){ alert('Grow mode: enter the fragment SMILES.'); return; }
+    if (!refEl.files.length){ alert('Grow mode: upload the bound fragment as the reference ligand (SDF).'); return; }
+    if (!document.getElementById('fragCore').value.trim() &&
+        !confirm('No conserved core SMARTS given — the whole fragment must then appear unchanged in every product, which usually fails when the reaction consumes a handle (e.g. an acid OH leaves). Continue anyway?')) return;
+  }
 
   const fd = new FormData();
   fd.append('config', JSON.stringify(buildConfig()));
