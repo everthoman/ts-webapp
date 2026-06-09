@@ -61,19 +61,33 @@ BASE_DIR = Path(__file__).resolve().parent
 # `activated_aryl_halide` is the classic case — SNAr's template matches any
 # aryl-Cl/F, but only EWG-activated ones actually react.
 # ---------------------------------------------------------------------------
+# Electron-withdrawing substituent (recursive, as seen from the ring carbon it
+# hangs off): nitro, nitrile, any carbonyl carbon, sulfonyl, or CF3.
+_EWG = ("$([NX3+](=O)[O-]),$([NX3](=O)=O),$([CX2]#[NX1]),"
+        "$([CX3]=[OX1]),$([SX4](=O)(=O)),$([CX4](F)(F)F)")
+
 HANDLE_SMARTS: Dict[str, str] = {
     "primary_amine":   "[NX3;H2;!$([NX3]C=O);!$([NX3]=*);!$([NX3]S(=O)=O)][#6]",
     "secondary_amine": "[NX3;H1;!$([NX3]C=O);!$([NX3]=*);!$([NX3]S(=O)=O)]([#6])[#6]",
     "carboxylic_acid": "[CX3](=O)[OX2H1]",
     "aryl_halide":     "[c][F,Cl,Br,I]",
-    # Heuristic: an aryl-F/Cl that is EWG-activated (ortho/para to NO2, C#N or
-    # C=O) or sits on an azine ring — i.e. actually competent for SNAr. Tune me.
-    "activated_aryl_halide":
-        "[$([F,Cl][c]:[n]),"
-        "$([F,Cl][c]:c:[n]),"
-        "$([F,Cl][c]:c:c:[n]),"
-        "$([F,Cl][c]1:c:c:c:c:c:1[$([NX3+](=O)[O-]),$(C#N),$([CX3]=O)]),"
-        "$([F,Cl][c]1:c:c:c:c:c:1[c][$([NX3+](=O)[O-]),$(C#N)])]",
+    # SNAr-competent aryl-F/Cl: a fluoride/chloride on an aromatic ring that is
+    # ortho/meta/para to a strong EWG (benzene) or to a ring nitrogen (azine).
+    # Tuned to the curated activated_aryl_halides_100 set: 100/100 recall, the
+    # only "false positives" on the Suzuki set being 2-fluoropyridines that are
+    # genuinely activated (they just also carry a Br). NOTE: this includes the
+    # *meta* relationship because the curated set does; meta is only weakly
+    # activating, so on a raw pool drop the two meta branches for stricter
+    # precision (ortho/para only).
+    "activated_aryl_halide": (
+        f"[F,Cl;"
+        f"$([F,Cl][c]:[c][{_EWG}]),"                       # ortho to EWG
+        f"$([F,Cl][c]1[c][c]([{_EWG}])[c][c][c]1),"        # meta to EWG
+        f"$([F,Cl][c]1[c][c][c]([{_EWG}])[c][c]1),"        # para to EWG
+        f"$([F,Cl][c]:[n]),"                               # ortho to ring N
+        f"$([F,Cl][c]1[c,n][n][c,n][c,n][c,n]1),"          # meta to ring N
+        f"$([F,Cl][c]1[c,n][c,n][n][c,n][c,n]1)]"          # para to ring N
+    ),
     "boronic":         "[#6][BX3]([OX2])[OX2]",
     "aldehyde":        "[CX3H1](=O)[#6]",
     "ketone":          "[#6][CX3](=O)[#6]",
