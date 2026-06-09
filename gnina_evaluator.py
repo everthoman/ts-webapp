@@ -437,9 +437,21 @@ class GninaEvaluator(Evaluator):
         self._emit_progress(score)
         return score, result_reason
 
+    # -- Overridable hooks (see AnchoredFragmentEvaluator) -------------------
+    def _prepare_pose(self, smiles: str) -> Tuple[Optional[str], Optional[str]]:
+        """Build the 3D ligand pose to dock. Default: free ETKDG embed at the
+        configured pH. Subclasses can override (e.g. constrained embed onto a
+        bound fragment) and return ``(sdf_block, error)``."""
+        return prepare_ligand_3d(smiles, self.ph, "ligand")
+
+    def _extra_flags(self) -> List[str]:
+        """Extra gnina command-line flags. Default: none. Subclasses can add
+        e.g. ``--local_only`` for anchored docking."""
+        return []
+
     # -- Docking ------------------------------------------------------------
     def _dock(self, smiles: str) -> float:
-        sdf_block, err = prepare_ligand_3d(smiles, self.ph, "ligand")
+        sdf_block, err = self._prepare_pose(smiles)
         if sdf_block is None:
             with self._lock:
                 self.prep_failures += 1
@@ -472,6 +484,7 @@ class GninaEvaluator(Evaluator):
             "--cpu", str(self.cpu),
             "--seed", str(self.seed),
         ]
+        cmd += self._extra_flags()
 
         env = os.environ.copy()
         # CNN scoring is the GPU-bound step. With cnn_scoring="none" gnina does
