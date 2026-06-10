@@ -63,6 +63,43 @@ from gnina_evaluator import (
 )
 
 
+def _match_core(frag: Chem.Mol, core_str: str):
+    """Find the conserved core in ``frag``. ``core_str`` may be SMARTS or SMILES;
+    we try both, then an aromaticity-tolerant fallback, so the user doesn't have
+    to know which the field wants. Returns ``(match_tuple, query_mol)`` (match is
+    () when nothing hits)."""
+    queries = []
+    qs = Chem.MolFromSmarts(core_str)
+    if qs is not None:
+        queries.append(qs)
+    qm = Chem.MolFromSmiles(core_str)        # users often paste SMILES
+    if qm is not None:
+        queries.append(qm)
+    if not queries:
+        raise ValueError(f"core could not be parsed as SMARTS or SMILES: '{core_str}'")
+    for q in queries:
+        m = frag.GetSubstructMatch(q)
+        if m:
+            return m, q
+    # Aromaticity-tolerant retry: kekulize both sides and match without the
+    # aromatic-flag constraint (catches kekulized-vs-aromatic mismatches).
+    try:
+        frag_k = Chem.Mol(frag)
+        Chem.Kekulize(frag_k, clearAromaticFlags=True)
+        for q in queries:
+            qk = Chem.Mol(q)
+            try:
+                Chem.Kekulize(qk, clearAromaticFlags=True)
+            except Exception:
+                pass
+            m = frag_k.GetSubstructMatch(qk)
+            if m:
+                return m, q
+    except Exception:
+        pass
+    return (), queries[0]
+
+
 def _load_core(fragment_sdf: str, core_smarts: Optional[str]) -> Chem.Mol:
     """
     Build the conserved-core template (a 3D mol) used both to seed the embed and
@@ -84,12 +121,15 @@ def _load_core(fragment_sdf: str, core_smarts: Optional[str]) -> Chem.Mol:
         raise ValueError("Fragment SDF has no 3D conformer (need the bound pose)")
     if core_smarts is None:
         return frag
-    q = Chem.MolFromSmarts(core_smarts)
-    if q is None:
-        raise ValueError(f"Bad core_smarts: {core_smarts}")
-    match = frag.GetSubstructMatch(q)
+    match, q = _match_core(frag, core_smarts)
     if not match:
-        raise ValueError("core_smarts does not match the fragment")
+        frag_smiles = Chem.MolToSmiles(frag)
+        raise ValueError(
+            f"core_smarts '{core_smarts}' does not match the fragment "
+            f"(fragment from SDF = '{frag_smiles}'). The core must be a "
+            f"substructure of the bound fragment; check aromaticity (e.g. use "
+            f"aromatic 'c1ccncc1', not kekulized 'C1=CC=NC=C1') and that you "
+            f"excluded only the reacting handle, not ring atoms.")
     # Carve the matched atoms out *with their coordinates* into a core template.
     core = Chem.RWMol()
     conf = frag.GetConformer()
@@ -97,7 +137,11 @@ def _load_core(fragment_sdf: str, core_smarts: Optional[str]) -> Chem.Mol:
     new_conf_pts = []
     for old_idx in match:
         a = frag.GetAtomWithIdx(old_idx)
-        old2new[old_idx] = core.AddAtom(Chem.Atom(a.GetAtomicNum()))
+        # Copy the whole atom (not just the atomic number) so explicit Hs,
+        # formal charge and the aromatic flag survive -- without the pyrrole
+        # N-H, an NH-aromatic core (indole/pyrrole/imidazole...) can't be
+        # kekulized and SanitizeMol below blows up with "Can't kekulize mol".
+        old2new[old_idx] = core.AddAtom(a)
         new_conf_pts.append(conf.GetAtomPosition(old_idx))
     for b in frag.GetBonds():
         i, j = b.GetBeginAtomIdx(), b.GetEndAtomIdx()
@@ -108,7 +152,17 @@ def _load_core(fragment_sdf: str, core_smarts: Optional[str]) -> Chem.Mol:
     for new_idx, pt in enumerate(new_conf_pts):
         new_conf.SetAtomPosition(new_idx, pt)
     core.AddConformer(new_conf, assignId=True)
-    Chem.SanitizeMol(core)
+    try:
+        Chem.SanitizeMol(core)
+    except Exception as e:
+        # The carved sub-graph won't sanitize -- almost always because the
+        # core_smarts cut through an aromatic ring (an in-ring atom was
+        # excluded), leaving a partial ring that can't be kekulized.
+        raise ValueError(
+            f"the conserved core carved from the fragment is not a valid "
+            f"substructure ({e}). This usually means core_smarts excluded an "
+            f"in-ring atom -- exclude only the reacting handle (the leaving "
+            f"atom/group), and keep whole aromatic rings intact.") from e
     return core
 
 
