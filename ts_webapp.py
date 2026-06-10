@@ -39,7 +39,6 @@ from rdkit.Chem import AllChem, Crippen, Descriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 
 from gnina_evaluator import GninaEvaluator, MolFilters, DockingCancelled, GNINA_PATH, DOCK_CPU
-from anchored_fragment_evaluator import AnchoredFragmentEvaluator
 from route_sampler import RouteSampler
 from ts_utils import read_reagents
 
@@ -201,31 +200,6 @@ def _resolve_set(set_id: str) -> str:
     return str(path)
 
 
-# Grow-from-fragment: the fixed bound fragment occupies one component of the
-# start step. The UI marks that slot with this sentinel in step.reagent_sets;
-# the route builders turn it into a one-line .smi (so the sampler reads it like
-# any other reagent file) while leaving the other components to vary.
-FRAGMENT_SENTINEL = "__fragment__"
-
-
-def _grow_cfg(cfg: dict) -> Optional[dict]:
-    """Return the grow block when grow-from-fragment is enabled, else None."""
-    g = cfg.get("grow") or {}
-    return g if g.get("enabled") else None
-
-
-def _frag_file(fragment_smiles: Optional[str], work_dir) -> str:
-    """Write the fixed fragment SMILES as a one-line .smi in ``work_dir`` and
-    return its path. Raises if grow mode is missing the SMILES / a work dir."""
-    if not fragment_smiles or not fragment_smiles.strip():
-        raise HTTPException(400, "Grow mode: a fragment SMILES is required")
-    if not work_dir:
-        raise HTTPException(500, "Grow mode: no work directory for the fragment file")
-    p = Path(work_dir) / "fragment.smi"
-    p.write_text(f"{fragment_smiles.strip()}\tFRAG\n")
-    return str(p)
-
-
 def _write_meta(job_dir: Path, data: dict) -> None:
     """Persist a job's metadata (config + runtime status) to job.json."""
     try:
@@ -281,18 +255,13 @@ def _slugify(name: str) -> str:
     return slug[:64]
 
 
-def _build_route(steps_cfg: List[dict], fragment_smiles: Optional[str] = None, frag_dir=None):
-    """Return (reagent_file_list, route_steps, human_summary).
-
-    In grow mode a component whose chosen set is ``FRAGMENT_SENTINEL`` is filled
-    from the fixed fragment SMILES (written once to ``frag_dir/fragment.smi``)
-    instead of a curated set."""
+def _build_route(steps_cfg: List[dict]):
+    """Return (reagent_file_list, route_steps, human_summary)."""
     if not steps_cfg:
         raise HTTPException(400, "No reaction steps selected")
     reagent_file_list: List[str] = []
     route_steps = []
     summary = []
-    frag_path: Optional[str] = None
     for i, step in enumerate(steps_cfg):
         rid = step.get("reaction_id")
         rxn = REACTIONS.get(rid)
@@ -310,25 +279,18 @@ def _build_route(steps_cfg: List[dict], fragment_smiles: Optional[str] = None, f
             )
         labels = []
         for set_id in chosen:
-            if set_id == FRAGMENT_SENTINEL:
-                if frag_path is None:
-                    frag_path = _frag_file(fragment_smiles, frag_dir)
-                reagent_file_list.append(frag_path)
-                labels.append("Fragment (fixed)")
-            else:
-                reagent_file_list.append(_resolve_set(set_id))
-                labels.append(REAGENT_SETS[set_id]["label"])
+            reagent_file_list.append(_resolve_set(set_id))
+            labels.append(REAGENT_SETS[set_id]["label"])
         route_steps.append((rxn["smarts"], len(chosen)))
         summary.append(f"Step {i+1}: {rxn['name']} [{', '.join(labels)}]")
     return reagent_file_list, route_steps, summary
 
 
-def _build_route_pool(steps_cfg: List[dict], work_dir: Path, fragment_smiles: Optional[str] = None):
+def _build_route_pool(steps_cfg: List[dict], work_dir: Path):
     """Pool-mode route: prune the master pool per component by the classes each
     reaction component accepts, writing a per-component .smi into ``work_dir`` so
     the sampler reads it like any other reagent file. Returns the same tuple as
-    :func:`_build_route`. A component marked ``FRAGMENT_SENTINEL`` (grow mode) is
-    filled from the fixed fragment SMILES instead of pruned from the pool."""
+    :func:`_build_route`."""
     if not steps_cfg:
         raise HTTPException(400, "No reaction steps selected")
     if not POOL:
@@ -338,7 +300,6 @@ def _build_route_pool(steps_cfg: List[dict], work_dir: Path, fragment_smiles: Op
     reagent_file_list: List[str] = []
     route_steps = []
     summary = []
-    frag_path: Optional[str] = None
     for i, step in enumerate(steps_cfg):
         rid = step.get("reaction_id")
         rxn = REACTIONS.get(rid)
@@ -348,15 +309,8 @@ def _build_route_pool(steps_cfg: List[dict], work_dir: Path, fragment_smiles: Op
             raise HTTPException(400, f"Step 1 must be a 'start' reaction, got '{rid}'")
         if i > 0 and rxn.get("role") != "extend":
             raise HTTPException(400, f"Step {i+1} must be an 'extend' reaction, got '{rid}'")
-        chosen = step.get("reagent_sets", [])
         labels = []
         for j, comp in enumerate(rxn["components"]):
-            if j < len(chosen) and chosen[j] == FRAGMENT_SENTINEL:
-                if frag_path is None:
-                    frag_path = _frag_file(fragment_smiles, work_dir)
-                reagent_file_list.append(frag_path)
-                labels.append(f"{comp['label']} [fragment, fixed]")
-                continue
             accepts = comp.get("accepts", [])
             ids = _pool_candidates(accepts)
             if not ids:
@@ -474,26 +428,7 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
                 eval_dict["center"] = tuple(bs["center"])
                 eval_dict["box_size"] = bs.get("box_size", 16.0)
 
-            grow = _grow_cfg(cfg)
-            if grow:
-                if bs["mode"] != "reference":
-                    raise RuntimeError(
-                        "Grow-from-fragment requires reference (autobox) mode — "
-                        "upload the bound fragment as the reference ligand")
-                eval_dict.update(
-                    fragment_sdf=str(job.dir / "reference.sdf"),
-                    core_smarts=(grow.get("core_smarts") or None),
-                    max_core_rmsd=float(grow.get("max_core_rmsd", 1.5)),
-                    local_only=bool(grow.get("local_only", True)),
-                )
-                evaluator = AnchoredFragmentEvaluator(eval_dict)
-                job.log(
-                    f"Grow-from-fragment: anchored to reference.sdf, core SMARTS "
-                    f"{grow.get('core_smarts') or '(whole fragment)'}, "
-                    f"max core drift {eval_dict['max_core_rmsd']} Å, --local_only="
-                    f"{eval_dict['local_only']}")
-            else:
-                evaluator = GninaEvaluator(eval_dict)
+            evaluator = GninaEvaluator(eval_dict)
             job.evaluator = evaluator
 
             sampler = RouteSampler(mode=mode)
@@ -755,12 +690,7 @@ async def run(
 ):
     cfg = json.loads(config)
     source = cfg.get("reagent_source", "sets")
-    grow = _grow_cfg(cfg)
     bs = cfg.get("binding_site", {})
-    if grow and bs.get("mode") != "reference":
-        raise HTTPException(400, "Grow-from-fragment requires reference (autobox) "
-                                 "mode — upload the bound fragment as the reference ligand")
-    frag_smiles = grow.get("fragment_smiles") if grow else None
 
     # Optional human-readable session name. Re-running the same name overwrites
     # that session's previous results; a blank name falls back to a random id
@@ -777,15 +707,14 @@ async def run(
     job = Job(id=job_id, dir=job_dir)
     JOBS[job_id] = job
 
-    # Both route builders may write into the job dir (pool .smi / fragment .smi),
-    # so they run after it exists. Clean up the half-made job on any bad config.
+    # Pool mode writes per-component .smi into the job dir, so the route builders
+    # run after it exists. Clean up the half-made job on any bad config.
     try:
         if source == "pool":
             reagent_file_list, route_steps, summary = _build_route_pool(
-                cfg.get("steps", []), job_dir, fragment_smiles=frag_smiles)
+                cfg.get("steps", []), job_dir)
         else:
-            reagent_file_list, route_steps, summary = _build_route(
-                cfg.get("steps", []), fragment_smiles=frag_smiles, frag_dir=job_dir)
+            reagent_file_list, route_steps, summary = _build_route(cfg.get("steps", []))
     except HTTPException:
         shutil.rmtree(job_dir, ignore_errors=True)
         JOBS.pop(job_id, None)
@@ -858,8 +787,6 @@ async def rerun(job_id: str):
         raise HTTPException(409, f"'{job_id}' is already running")
 
     source = cfg.get("reagent_source", "sets")
-    grow = _grow_cfg(cfg)
-    frag_smiles = grow.get("fragment_smiles") if grow else None
 
     # Preserve the uploaded receptor/reference across the in-place overwrite.
     has_ref = (src / "reference.sdf").is_file()
@@ -874,14 +801,13 @@ async def rerun(job_id: str):
         shutil.copy(tmp / "reference.sdf", src / "reference.sdf")
     shutil.rmtree(tmp, ignore_errors=True)
 
-    # Build the route after the dir is restored — both builders may write the
-    # fragment / per-component .smi into it.
+    # Build the route after the dir is restored — pool mode writes per-component
+    # .smi into it.
     if source == "pool":
         reagent_file_list, route_steps, summary = _build_route_pool(
-            cfg.get("steps", []), src, fragment_smiles=frag_smiles)
+            cfg.get("steps", []), src)
     else:
-        reagent_file_list, route_steps, summary = _build_route(
-            cfg.get("steps", []), fragment_smiles=frag_smiles, frag_dir=src)
+        reagent_file_list, route_steps, summary = _build_route(cfg.get("steps", []))
 
     job = Job(id=job_id, dir=src)
     JOBS[job_id] = job
@@ -906,12 +832,7 @@ async def candidates(config: str = Form(...)):
         rxn = REACTIONS.get(step.get("reaction_id"))
         if rxn is None:
             raise HTTPException(400, f"Unknown reaction: {step.get('reaction_id')}")
-        chosen = step.get("reagent_sets", [])
         for j, comp in enumerate(rxn["components"]):
-            if j < len(chosen) and chosen[j] == FRAGMENT_SENTINEL:
-                comps.append({"step": i + 1, "label": comp["label"] + " (fragment, fixed)",
-                              "accepts": [], "count": 1})
-                continue  # fixed single fragment; library factor is ×1
             accepts = comp.get("accepts", [])
             n = len(_pool_candidates(accepts))
             lib *= n
@@ -926,18 +847,13 @@ async def preflight(config: str = Form(...)):
     """Sample random products and report filter pass-rate + MW/logP spread,
     so a too-tight filter is caught before committing to a full run."""
     cfg = json.loads(config)
-    grow = _grow_cfg(cfg)
-    frag_smiles = grow.get("fragment_smiles") if grow else None
     work_tmp = None
     if cfg.get("reagent_source") == "pool":
         work_tmp = Path(tempfile.mkdtemp(prefix="ts_pf_"))
         reagent_file_list, route_steps, _summary = _build_route_pool(
-            cfg.get("steps", []), work_tmp, fragment_smiles=frag_smiles)
+            cfg.get("steps", []), work_tmp)
     else:
-        if grow:  # need a dir to write the fragment .smi
-            work_tmp = Path(tempfile.mkdtemp(prefix="ts_pf_"))
-        reagent_file_list, route_steps, _summary = _build_route(
-            cfg.get("steps", []), fragment_smiles=frag_smiles, frag_dir=work_tmp)
+        reagent_file_list, route_steps, _summary = _build_route(cfg.get("steps", []))
     fcfg = cfg.get("filters", {})
     filters = MolFilters(
         use_pains=fcfg.get("pains", False),
@@ -1014,18 +930,10 @@ async def extend_options(config: str = Form(...)):
     upstream = cfg.get("steps", [])
     if not upstream:
         raise HTTPException(400, "No upstream steps to extend")
-    grow = _grow_cfg(cfg)
-    frag_smiles = grow.get("fragment_smiles") if grow else None
-    frag_tmp = Path(tempfile.mkdtemp(prefix="ts_ext_")) if grow else None
-    try:
-        reagent_file_list, route_steps, _ = _build_route(
-            upstream, fragment_smiles=frag_smiles, frag_dir=frag_tmp)
-        up = RouteSampler(mode="minimize")
-        # Cap reads: a representative sample is plenty and keeps the dropdown snappy.
-        up.read_reagents(reagent_file_list=reagent_file_list, num_to_select=400)
-    finally:
-        if frag_tmp is not None:
-            shutil.rmtree(frag_tmp, ignore_errors=True)
+    reagent_file_list, route_steps, _ = _build_route(upstream)
+    up = RouteSampler(mode="minimize")
+    # Cap reads: a representative sample is plenty and keeps the dropdown snappy.
+    up.read_reagents(reagent_file_list=reagent_file_list, num_to_select=400)
     up.set_route(route_steps)
 
     n = 200
