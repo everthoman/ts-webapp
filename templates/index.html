@@ -319,11 +319,19 @@ function setOptions(sel, ids, sets){
 }
 
 function reagentRowsFor(reaction, stepIdx){
-  // one <select> per component (curated sets).
+  // one <select> per component (curated sets + any reagents/*.smi files).
+  const customOpts = Object.entries(CATALOG.reagent_sets)
+    .filter(([k]) => k.startsWith('custom:'))
+    .map(([k, v]) => `<option value="${k}">${v.label}</option>`)
+    .join('');
+  const customBlock = customOpts
+    ? `<option disabled>── custom ──</option>${customOpts}`
+    : '';
   return reaction.components.map((c, ci) => {
     return `<label style="margin-top:8px">${c.label}</label>
     <select data-step="${stepIdx}" data-comp="${ci}" class="reagentSel">
       ${c.sets.map(s => `<option value="${s}">${CATALOG.reagent_sets[s].label}</option>`).join('')}
+      ${customBlock}
     </select>`;
   }).join('');
 }

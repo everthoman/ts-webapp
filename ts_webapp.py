@@ -91,6 +91,28 @@ def _load_pool() -> None:
 _load_pool()
 
 
+def _load_custom_sets() -> None:
+    """Scan reagents/*.smi and inject them into CATALOG/REAGENT_SETS at startup."""
+    reagents_dir = BASE_DIR / "reagents"
+    if not reagents_dir.is_dir():
+        return
+    for p in sorted(reagents_dir.glob("*.smi")):
+        key = f"custom:{p.stem}"
+        try:
+            count = sum(1 for ln in p.open() if ln.strip() and not ln.startswith("#"))
+        except Exception:
+            count = 0
+        CATALOG["reagent_sets"][key] = {
+            "file": str(p.relative_to(BASE_DIR)),
+            "count": count,
+            "label": f"{p.stem} ({count:,})",
+            "custom": True,
+        }
+
+
+_load_custom_sets()
+
+
 def _pool_candidates(accepts: List[str]) -> List[str]:
     """Block ids matching any of the accepted fg classes (deduped, order-stable)."""
     ids: List[str] = []
