@@ -45,6 +45,52 @@ from rdkit.Chem import AllChem, Crippen, Descriptors
 from evaluators import Evaluator
 
 # ---------------------------------------------------------------------------
+# N-protecting group removal — applied to every product before docking so
+# that Boc/Fmoc/Cbz building blocks are scored as their free-amine products.
+# ---------------------------------------------------------------------------
+_DEPROTECT_RXNS: List = []
+
+
+def _init_deprotect() -> None:
+    global _DEPROTECT_RXNS
+    _DEPROTECT_RXNS = [
+        AllChem.ReactionFromSmarts("[N:1][C](=O)OCC1c2ccccc2-c2ccccc21>>[N:1]"),  # Fmoc
+        AllChem.ReactionFromSmarts("[N:1][C](=O)OC(C)(C)C>>[N:1]"),               # Boc
+        AllChem.ReactionFromSmarts("[N:1][C](=O)OCc1ccccc1>>[N:1]"),              # Cbz
+    ]
+
+
+_init_deprotect()
+
+
+def deprotect_smiles(smiles: str) -> str:
+    """Strip Fmoc/Boc/Cbz carbamate protecting groups from a SMILES string.
+
+    Iterates until no more groups can be removed (handles multiply-protected
+    intermediates). Returns the original SMILES unchanged on any parse error.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return smiles
+    changed = True
+    while changed:
+        changed = False
+        for rxn in _DEPROTECT_RXNS:
+            products = rxn.RunReactants((mol,))
+            if not products:
+                continue
+            try:
+                p = products[0][0]
+                Chem.SanitizeMol(p)
+                mol = p
+                changed = True
+                break
+            except Exception:
+                continue
+    return Chem.MolToSmiles(mol)
+
+
+# ---------------------------------------------------------------------------
 # Configuration / external tools
 # ---------------------------------------------------------------------------
 GNINA_PATH = os.environ.get("GNINA_PATH", "/opt/gnina/gnina.1.3.2")
@@ -410,9 +456,16 @@ class GninaEvaluator(Evaluator):
             if smiles in self._score_cache:
                 return self._score_cache[smiles], self._reason_cache.get(smiles)
 
+        # Strip Fmoc/Boc/Cbz before filtering and docking so products are
+        # scored as their free-amine forms and MW/logP filters see the real
+        # product. Cache stays keyed by the original (protected) SMILES so the
+        # sampler's internal accounting is undisturbed.
+        dock_smiles = deprotect_smiles(smiles)
+        dock_mol = Chem.MolFromSmiles(dock_smiles) if dock_smiles != smiles else mol
+
         # Hard filters before docking.
         if self.filters is not None and self.filters.active:
-            reason = self.filters.reject_reason(mol)
+            reason = self.filters.reject_reason(dock_mol or mol)
             if reason is not None:
                 key = reason.split(":")[0].split(" ")[0]
                 with self._lock:
@@ -429,7 +482,7 @@ class GninaEvaluator(Evaluator):
 
         # Docking (the slow part) runs without the lock held so parallel docks
         # actually overlap; only the bookkeeping around it is serialised.
-        score = self._dock(smiles)
+        score = self._dock(dock_smiles)
         result_reason = None if np.isfinite(score) else "fail"
         with self._lock:
             self._score_cache[smiles] = score
