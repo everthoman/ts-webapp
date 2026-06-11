@@ -54,9 +54,15 @@ _DEPROTECT_RXNS: List = []
 def _init_deprotect() -> None:
     global _DEPROTECT_RXNS
     _DEPROTECT_RXNS = [
+        # N-carbamate PGs
         AllChem.ReactionFromSmarts("[N:1][C](=O)OCC1c2ccccc2-c2ccccc21>>[N:1]"),  # Fmoc
         AllChem.ReactionFromSmarts("[N:1][C](=O)OC(C)(C)C>>[N:1]"),               # Boc
         AllChem.ReactionFromSmarts("[N:1][C](=O)OCc1ccccc1>>[N:1]"),              # Cbz
+        # Acid PGs — [#6] neighbour on carbonyl excludes carbamates (N-C(=O)-O-)
+        AllChem.ReactionFromSmarts("[#6:2][C:1](=O)OC(C)(C)C>>[#6:2][C:1](=O)O"),  # tBu ester
+        AllChem.ReactionFromSmarts("[#6:2][C:1](=O)OCc1ccccc1>>[#6:2][C:1](=O)O"), # Bn ester
+        # Boronic esters
+        AllChem.ReactionFromSmarts("[#6:1][B]1OC(C)(C)C(C)(C)O1>>[#6:1][B](O)O"), # Bpin
     ]
 
 
