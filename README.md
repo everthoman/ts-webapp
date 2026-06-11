@@ -24,6 +24,7 @@ without ever enumerating or docking the whole library.
 | **GNINA docking as the scoring function** (Vina `minimizedAffinity` on CPU by default, or CNN scores on GPU) | `gnina_evaluator.py` → `GninaEvaluator` |
 | **Pre-dock hard filters** — PAINS, REOS (reusing `ligprepper` SMARTS), MW range, logP range | `gnina_evaluator.py` → `MolFilters` |
 | **Ligand prep** — OpenBabel protonation at pH + RDKit ETKDGv3 / MMFF94s 3D embed | `gnina_evaluator.py` |
+| **Automatic deprotection before docking** — Fmoc/Boc/Cbz amines, tBu/Bn esters, Bpin boronates stripped so products are scored as their free forms | `gnina_evaluator.py` → `deprotect_smiles` |
 | **Multi-step linear reaction routes** — chain reactions; only the final product is docked | `route_sampler.py` → `RouteSampler` |
 | **Web app** — pick reactions/reagents, upload receptor, set filters, watch live progress, download results + poses | `ts_webapp.py`, `templates/index.html` |
 
@@ -82,9 +83,12 @@ single-reaction `ThompsonSampler`.
 
 **Docking / web app (added here)**
 - `ts_webapp.py` — FastAPI app + job manager
-- `gnina_evaluator.py` — `GninaEvaluator`, `MolFilters`, ligand prep
+- `gnina_evaluator.py` — `GninaEvaluator`, `MolFilters`, ligand prep, `deprotect_smiles`
 - `route_sampler.py` — `RouteSampler` (multi-step routes)
 - `reactions.json` — predefined reaction + reagent-set catalog
+- `functional_groups.json` — FG vocabulary for the synthon reagent model
+- `build_reagents.py` — tag a reagent pool against the FG vocabulary; produces `data/reagents_registry.csv` + `data/reagents_index.json`
+- `reagents/` — raw reagent pool files (`.smi`); any file placed here is auto-discovered as a selectable reagent set in the UI
 - `templates/index.html` — UI
 - `run_webapp.sh`, `ts-gnina-webapp.service`, `requirements-webapp.txt`, `TS_WEBAPP_README.md`
 
