@@ -169,3 +169,6 @@ data/*.zip
 data/reagents_master.csv
 data/reagents_registry.csv
 data/reagents_index.json
+# Raw reagent source files (large binaries; keep only the generated .smi)
+reagents/*.sdf
+reagents/*.zip
