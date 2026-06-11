@@ -38,7 +38,7 @@ from rdkit import Chem
 from rdkit.Chem import AllChem, Crippen, Descriptors
 from rdkit.Chem.Draw import rdMolDraw2D
 
-from gnina_evaluator import GninaEvaluator, MolFilters, DockingCancelled, GNINA_PATH, DOCK_CPU
+from gnina_evaluator import GninaEvaluator, MolFilters, DockingCancelled, GNINA_PATH, DOCK_CPU, deprotect_smiles
 from route_sampler import RouteSampler
 from ts_utils import read_reagents
 
@@ -532,9 +532,10 @@ def _run_job(job: Job, cfg: dict, reagent_file_list, route_steps, summary):
             # Warm-up products are docked too; include them so nothing is lost.
             out_list = warmup_results + search_results
 
-            # Results
+            # Results — deprotect SMILES so results show the scored free form
             out_df = pd.DataFrame(out_list, columns=["score", "SMILES", "Name"])
             out_df = out_df.dropna(subset=["score"])
+            out_df["SMILES"] = out_df["SMILES"].map(deprotect_smiles)
             ascending = (mode == "minimize")
             out_df = out_df.sort_values("score", ascending=ascending).drop_duplicates(subset="SMILES")
             results_csv = job.dir / "results.csv"

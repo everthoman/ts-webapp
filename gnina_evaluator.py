@@ -452,22 +452,22 @@ class GninaEvaluator(Evaluator):
         except Exception:
             return np.nan, "fail"
 
+        # Deprotect early so every cache (score, reason, name, pose) is keyed
+        # by the free form. This makes top_scored() and write_top_poses() return
+        # deprotected SMILES directly, and avoids double-docking the same molecule
+        # once protected and once free.
+        dock_smiles = deprotect_smiles(smiles)
+        dock_mol = Chem.MolFromSmiles(dock_smiles) if dock_smiles != smiles else mol
+
         # The sampler stamps the reagent-combo name onto the mol; capture it so
         # the live gallery can label products before results.csv is written.
         if mol.HasProp("_Name"):
             with self._lock:
-                self._name_cache.setdefault(smiles, mol.GetProp("_Name"))
+                self._name_cache.setdefault(dock_smiles, mol.GetProp("_Name"))
 
         with self._lock:
-            if smiles in self._score_cache:
-                return self._score_cache[smiles], self._reason_cache.get(smiles)
-
-        # Strip Fmoc/Boc/Cbz before filtering and docking so products are
-        # scored as their free-amine forms and MW/logP filters see the real
-        # product. Cache stays keyed by the original (protected) SMILES so the
-        # sampler's internal accounting is undisturbed.
-        dock_smiles = deprotect_smiles(smiles)
-        dock_mol = Chem.MolFromSmiles(dock_smiles) if dock_smiles != smiles else mol
+            if dock_smiles in self._score_cache:
+                return self._score_cache[dock_smiles], self._reason_cache.get(dock_smiles)
 
         # Hard filters before docking.
         if self.filters is not None and self.filters.active:
@@ -476,8 +476,8 @@ class GninaEvaluator(Evaluator):
                 key = reason.split(":")[0].split(" ")[0]
                 with self._lock:
                     self.rejections[key] = self.rejections.get(key, 0) + 1
-                    self._score_cache[smiles] = np.nan
-                    self._reason_cache[smiles] = "filtered"
+                    self._score_cache[dock_smiles] = np.nan
+                    self._reason_cache[dock_smiles] = "filtered"
                     total_rej = sum(self.rejections.values())
                     snapshot = dict(self.rejections)
                 if self.progress_callback is not None and total_rej % 100 == 0:
@@ -491,8 +491,8 @@ class GninaEvaluator(Evaluator):
         score = self._dock(dock_smiles)
         result_reason = None if np.isfinite(score) else "fail"
         with self._lock:
-            self._score_cache[smiles] = score
-            self._reason_cache[smiles] = result_reason
+            self._score_cache[dock_smiles] = score
+            self._reason_cache[dock_smiles] = result_reason
         self._emit_progress(score)
         return score, result_reason
 
