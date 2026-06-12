@@ -55,6 +55,7 @@ from typing import Dict, List, Optional, Tuple
 
 from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem, Crippen, Descriptors
+from rdkit.Chem.MolStandardize import rdMolStandardize
 
 RDLogger.DisableLog("rdApp.*")  # silence per-molecule parse warnings
 
@@ -158,11 +159,28 @@ def reaction_component_queries(reactions: List[dict]) -> List[Tuple[str, str, Ch
     return cols
 
 
+def _enamine_id_key(name: str):
+    """Sort key for Enamine catalog IDs: numeric value if purely numeric, else the
+    raw string, so the lowest catalog number wins when deduplicating."""
+    try:
+        return (0, int(name))
+    except ValueError:
+        return (1, name)
+
+
 def read_pool(paths: List[Path]) -> List[Tuple[str, str]]:
-    """Read ``SMILES name`` lines from the input file(s), dedupe by canonical
-    SMILES, keep the first name seen."""
-    seen: Dict[str, str] = {}
-    n_lines = n_bad = 0
+    """Read ``SMILES name`` lines from the input file(s).
+
+    Each molecule is salt-stripped (largest fragment kept), neutralized, then
+    canonicalized.  When multiple input lines map to the same canonical SMILES
+    the one with the lowest Enamine catalog ID (numeric sort) is kept.
+    """
+    chooser = rdMolStandardize.LargestFragmentChooser()
+    uncharger = rdMolStandardize.Uncharger()
+
+    # canonical SMILES -> (name, id_key)
+    seen: Dict[str, Tuple[str, tuple]] = {}
+    n_lines = n_bad = n_salt = n_neutralized = 0
     for p in paths:
         with open(p) as fh:
             for line in fh:
@@ -177,11 +195,24 @@ def read_pool(paths: List[Path]) -> List[Tuple[str, str]]:
                 if mol is None:
                     n_bad += 1
                     continue
+                # Salt stripping: keep largest fragment
+                stripped = chooser.choose(mol)
+                if stripped.GetNumAtoms() < mol.GetNumAtoms():
+                    n_salt += 1
+                mol = stripped
+                # Neutralize formal charges where possible
+                uncharged = uncharger.uncharge(mol)
+                if Chem.MolToSmiles(uncharged) != Chem.MolToSmiles(mol):
+                    n_neutralized += 1
+                mol = uncharged
                 can = Chem.MolToSmiles(mol)
-                seen.setdefault(can, name)
+                key = _enamine_id_key(name)
+                if can not in seen or key < seen[can][1]:
+                    seen[can] = (name, key)
     print(f"Read {n_lines} lines from {len(paths)} file(s): "
-          f"{len(seen)} unique parseable, {n_bad} unparseable.", file=sys.stderr)
-    return list(seen.items())
+          f"{n_salt} salt-stripped, {n_neutralized} neutralized, "
+          f"{len(seen)} unique after dedup, {n_bad} unparseable.", file=sys.stderr)
+    return [(can, name) for can, (name, _key) in seen.items()]
 
 
 def classify(smiles: str, vocab: Vocab,

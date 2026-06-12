@@ -137,6 +137,83 @@
       "components": [
         {"label": "Aldehyde/ketone",   "accepts": ["aldehyde", "ketone"], "sets": ["aldehydes_ketones_100"]}
       ]
+    },
+    {
+      "id": "buchwald",
+      "name": "Buchwald-Hartwig (aryl Br/I + amine)",
+      "role": "start",
+      "takes_intermediate": false,
+      "smarts": "[c:1][Br,I].[NX3;H1,H2;!$([NX3]C=O);!$([NX3]=*);!$([NX3]S(=O)=O):2]>>[c:1][N:2]",
+      "components": [
+        {"label": "Aryl bromide/iodide", "accepts": ["aryl_halide"], "sets": []},
+        {"label": "Amine",               "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]}
+      ]
+    },
+    {
+      "id": "urea",
+      "name": "Urea formation (amine + isocyanate)",
+      "role": "start",
+      "takes_intermediate": false,
+      "smarts": "[NX3;H2:1].[#6][NX2:2]=[CX2:3]=[OX1:4]>>[N:1][C:3](=[O:4])[N:2]",
+      "components": [
+        {"label": "Primary amine",  "accepts": ["primary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]},
+        {"label": "Isocyanate",     "accepts": ["isocyanate"], "sets": []}
+      ]
+    },
+    {
+      "id": "sulfonamide",
+      "name": "Sulfonamide coupling (amine + sulfonyl chloride)",
+      "role": "start",
+      "takes_intermediate": false,
+      "smarts": "[NX3;H1,H2:1].[#6:2][SX4:3](=[OX1])(=[OX1])[Cl]>>[N:1][S:3](=[OX1])(=[OX1])[#6:2]",
+      "components": [
+        {"label": "Amine",           "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]},
+        {"label": "Sulfonyl chloride","accepts": ["sulfonyl_chloride"], "sets": []}
+      ]
+    },
+    {
+      "id": "mitsunobu",
+      "name": "Mitsunobu (alcohol + carboxylic acid → ester)",
+      "role": "start",
+      "takes_intermediate": false,
+      "smarts": "[#6:1][OH:2].[#6:3][CX3:4](=[OX1:5])[OX2H]>>[#6:1][O:2][CX3:4](=[OX1:5])[#6:3]",
+      "components": [
+        {"label": "Alcohol",          "accepts": ["alcohol"], "sets": []},
+        {"label": "Carboxylic acid",  "accepts": ["carboxylic_acid"], "sets": ["carboxylic_acids_100", "carboxylic_acids_500", "carboxylic_acids_ok"]}
+      ]
+    },
+    {
+      "id": "n_alkylation",
+      "name": "N-alkylation (amine + alkyl Br/I)",
+      "role": "start",
+      "takes_intermediate": false,
+      "smarts": "[NX3;H1,H2;!$([NX3]C=O);!$([NX3]=*);!$([NX3]S(=O)=O):1].[#6;!a:2][Br,I]>>[N:1][#6:2]",
+      "components": [
+        {"label": "Amine",         "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]},
+        {"label": "Alkyl halide",  "accepts": ["alkyl_halide"], "sets": []}
+      ]
+    },
+    {
+      "id": "sonogashira",
+      "name": "Sonogashira (aryl Br/I + terminal alkyne)",
+      "role": "start",
+      "takes_intermediate": false,
+      "smarts": "[c:1][Br,I].[#6][C:2]#[CH:3]>>[c:1][C:3]#[C:2]",
+      "components": [
+        {"label": "Aryl bromide/iodide", "accepts": ["aryl_halide"], "sets": []},
+        {"label": "Terminal alkyne",     "accepts": ["terminal_alkyne"], "sets": []}
+      ]
+    },
+    {
+      "id": "cuaac",
+      "name": "CuAAC (azide + terminal alkyne → 1,4-triazole)",
+      "role": "start",
+      "takes_intermediate": false,
+      "smarts": "[#6:6][N:1]=[N+:2]=[N-:3].[C:4]#[CH:5]>>[#6:6][N+0:1]1[N+0:2]=[N+0:3][C:4]=[C:5]1",
+      "components": [
+        {"label": "Azide",           "accepts": ["azide"], "sets": []},
+        {"label": "Terminal alkyne", "accepts": ["terminal_alkyne"], "sets": []}
+      ]
     }
   ]
 }

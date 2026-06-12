@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "_comment": "Functional-group vocabulary: reactions reference these class names; reagents are tagged by SMARTS match. 'refinement' classes are subsets of 'parent' and are excluded from the difunctional/conflict family tally.",
   "groups": {
     "primary_amine": {
@@ -43,6 +43,36 @@
       "smarts": "[#6][CX3](=O)[#6]",
       "label": "Ketone",
       "family": "carbonyl"
+    },
+    "sulfonyl_chloride": {
+      "smarts": "[SX4](=[OX1])(=[OX1])Cl",
+      "label": "Sulfonyl chloride",
+      "family": "sulfonyl_chloride"
+    },
+    "terminal_alkyne": {
+      "smarts": "[C;H1]#[C]",
+      "label": "Terminal alkyne",
+      "family": "alkyne"
+    },
+    "azide": {
+      "smarts": "[#6][NX2]=[N+X2]=[N-X1]",
+      "label": "Organic azide",
+      "family": "azide"
+    },
+    "alkyl_halide": {
+      "smarts": "[CX4][Br,I]",
+      "label": "Alkyl bromide/iodide",
+      "family": "alkyl_halide"
+    },
+    "isocyanate": {
+      "smarts": "[#6][NX2]=[CX2]=[OX1]",
+      "label": "Isocyanate",
+      "family": "isocyanate"
+    },
+    "alcohol": {
+      "smarts": "[OX2H][CX4]",
+      "label": "Aliphatic alcohol",
+      "family": "alcohol"
     }
   }
 }

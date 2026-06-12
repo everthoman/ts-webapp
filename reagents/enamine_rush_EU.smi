@@ -1,3 +1,5 @@
+NC1=NOC2=C1CCCC2 amine
+CC1=NC(=C(C)N1)C1=CC=C(CC(O)=O)C=C1 acid
 CCOc1ccc(N=C(CCl)Nc2ccc(OCC)cc2)cc1 06504
 CC(C)N(CC(=O)Nc1ccc(Cl)cc1C(F)(F)F)C(=O)CCl 09516
 CCCC(C)(C)O 61549

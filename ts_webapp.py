@@ -65,12 +65,13 @@ INDEX_JSON = BASE_DIR / "data" / "reagents_index.json"
 POOL: Dict[str, dict] = {}            # block id -> {"smiles", "name", "conflict"}
 POOL_BY_CLASS: Dict[str, list] = {}   # fg class -> [block ids]
 POOL_META: dict = {}
+POOL_SOURCE_CLASS_COUNTS: Dict[str, Dict[str, int]] = {}  # source -> class -> count
 
 
 def _load_pool() -> None:
     """Load the tagged registry + inverted index if present (best-effort)."""
-    global POOL, POOL_BY_CLASS, POOL_META
-    POOL, POOL_BY_CLASS, POOL_META = {}, {}, {}
+    global POOL, POOL_BY_CLASS, POOL_META, POOL_SOURCE_CLASS_COUNTS
+    POOL, POOL_BY_CLASS, POOL_META, POOL_SOURCE_CLASS_COUNTS = {}, {}, {}, {}
     if not (REGISTRY_CSV.is_file() and INDEX_JSON.is_file()):
         return
     try:
@@ -83,9 +84,22 @@ def _load_pool() -> None:
         POOL_META = {"n_reagents": idx.get("n_reagents"),
                      "counts": idx.get("counts", {}),
                      "vocab_version": idx.get("vocab_version")}
+        # Per-source, per-class counts so custom-set summaries can show accurate
+        # reagent counts for each reaction component slot rather than the pool total.
+        src_cls: Dict[str, Dict[str, int]] = {}
+        for r in df.itertuples(index=False):
+            src = r.source
+            if not src:
+                continue
+            for tag in r.fg_tags.split(";"):
+                tag = tag.strip()
+                if tag:
+                    src_cls.setdefault(src, {}).setdefault(tag, 0)
+                    src_cls[src][tag] += 1
+        POOL_SOURCE_CLASS_COUNTS = src_cls
     except Exception:
         logging.getLogger("ts_webapp").exception("Failed to load reagent pool")
-        POOL, POOL_BY_CLASS, POOL_META = {}, {}, {}
+        POOL, POOL_BY_CLASS, POOL_META, POOL_SOURCE_CLASS_COUNTS = {}, {}, {}, {}
 
 
 _load_pool()
@@ -277,6 +291,24 @@ def _slugify(name: str) -> str:
     return slug[:64]
 
 
+def _set_label_for_component(set_id: str, comp: dict) -> str:
+    """Return a human label for a reagent set used in a specific reaction component slot.
+    For custom sets, shows the count of reagents that match the component's accepted
+    classes rather than the total pool size."""
+    base_label = REAGENT_SETS[set_id]["label"]
+    if not set_id.startswith("custom:") or not POOL_SOURCE_CLASS_COUNTS:
+        return base_label
+    source = set_id[len("custom:"):]
+    src_counts = POOL_SOURCE_CLASS_COUNTS.get(source, {})
+    if not src_counts:
+        return base_label
+    accepts = comp.get("accepts", [])
+    n = sum(src_counts.get(cls, 0) for cls in accepts)
+    if n == 0:
+        return base_label
+    return f"{comp['label']} [{n:,} from {source}]"
+
+
 def _build_route(steps_cfg: List[dict]):
     """Return (reagent_file_list, route_steps, human_summary)."""
     if not steps_cfg:
@@ -300,9 +332,9 @@ def _build_route(steps_cfg: List[dict]):
                 f"Reaction '{rid}' needs {len(rxn['components'])} reagent set(s), got {len(chosen)}",
             )
         labels = []
-        for set_id in chosen:
+        for set_id, comp in zip(chosen, rxn["components"]):
             reagent_file_list.append(_resolve_set(set_id))
-            labels.append(REAGENT_SETS[set_id]["label"])
+            labels.append(_set_label_for_component(set_id, comp))
         route_steps.append((rxn["smarts"], len(chosen)))
         summary.append(f"Step {i+1}: {rxn['name']} [{', '.join(labels)}]")
     return reagent_file_list, route_steps, summary
