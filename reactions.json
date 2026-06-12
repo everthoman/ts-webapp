@@ -44,7 +44,7 @@
       "smarts": "[c:1][F,Cl].[NX3;H1,H2:2]>>[c:1][N:2]",
       "components": [
         {"label": "Activated aryl halide", "accepts": ["activated_aryl_halide"], "sets": ["activated_aryl_halides_100"]},
-        {"label": "Primary amine",         "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]}
+        {"label": "Primary/secondary amine", "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok", "secondary_amines_100", "secondary_amines_500", "secondary_amines_ok"]}
       ]
     },
     {
@@ -54,8 +54,8 @@
       "takes_intermediate": false,
       "smarts": "[$([CX3H1]=O),$([CX3]([#6])([#6])=O);!$([CX3](=O)[OX2]);!$([CX3](=O)[#7]):1]=[OX1].[NX3;H1,H2;!$([NX3]C=O):2]>>[C:1][N:2]",
       "components": [
-        {"label": "Aldehyde/ketone", "accepts": ["aldehyde", "ketone"], "sets": ["aldehydes_ketones_100"]},
-        {"label": "Primary amine",   "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]}
+        {"label": "Aldehyde/ketone",          "accepts": ["aldehyde", "ketone"], "sets": ["aldehydes_ketones_100"]},
+        {"label": "Primary/secondary amine",  "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok", "secondary_amines_100", "secondary_amines_500", "secondary_amines_ok"]}
       ]
     },
     {
@@ -75,7 +75,7 @@
       "takes_intermediate": true,
       "smarts": "[#6:1][C:3](=[OX1])[OX2H1].[NX3;H1,H2;!$([NX3]C=O):2]>>[#6:1][C:3](=O)[N:2]",
       "components": [
-        {"label": "Primary amine",     "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]}
+        {"label": "Primary/secondary amine", "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok", "secondary_amines_100", "secondary_amines_500", "secondary_amines_ok"]}
       ]
     },
     {
@@ -105,7 +105,7 @@
       "takes_intermediate": true,
       "smarts": "[c:1][F,Cl].[NX3;H1,H2;!$([NX3]C=O):2]>>[c:1][N:2]",
       "components": [
-        {"label": "Primary amine",     "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]}
+        {"label": "Primary/secondary amine", "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok", "secondary_amines_100", "secondary_amines_500", "secondary_amines_ok"]}
       ]
     },
     {
@@ -125,7 +125,7 @@
       "takes_intermediate": true,
       "smarts": "[$([CX3H1]=O),$([CX3]([#6])([#6])=O);!$([CX3](=O)[OX2]);!$([CX3](=O)[#7]):1]=[OX1].[NX3;H1,H2;!$([NX3]C=O):2]>>[C:1][N:2]",
       "components": [
-        {"label": "Primary amine",     "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]}
+        {"label": "Primary/secondary amine", "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok", "secondary_amines_100", "secondary_amines_500", "secondary_amines_ok"]}
       ]
     },
     {
@@ -145,8 +145,8 @@
       "takes_intermediate": false,
       "smarts": "[c:1][Br,I].[NX3;H1,H2;!$([NX3]C=O);!$([NX3]=*);!$([NX3]S(=O)=O):2]>>[c:1][N:2]",
       "components": [
-        {"label": "Aryl bromide/iodide", "accepts": ["aryl_halide"], "sets": []},
-        {"label": "Amine",               "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]}
+        {"label": "Aryl bromide/iodide",    "accepts": ["aryl_halide"], "sets": []},
+        {"label": "Primary/secondary amine","accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok", "secondary_amines_100", "secondary_amines_500", "secondary_amines_ok"]}
       ]
     },
     {
@@ -167,8 +167,8 @@
       "takes_intermediate": false,
       "smarts": "[NX3;H1,H2:1].[#6:2][SX4:3](=[OX1])(=[OX1])[Cl]>>[N:1][S:3](=[OX1])(=[OX1])[#6:2]",
       "components": [
-        {"label": "Amine",           "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]},
-        {"label": "Sulfonyl chloride","accepts": ["sulfonyl_chloride"], "sets": []}
+        {"label": "Primary/secondary amine", "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok", "secondary_amines_100", "secondary_amines_500", "secondary_amines_ok"]},
+        {"label": "Sulfonyl chloride",        "accepts": ["sulfonyl_chloride"], "sets": []}
       ]
     },
     {
@@ -189,8 +189,8 @@
       "takes_intermediate": false,
       "smarts": "[NX3;H1,H2;!$([NX3]C=O);!$([NX3]=*);!$([NX3]S(=O)=O):1].[#6;!a:2][Br,I]>>[N:1][#6:2]",
       "components": [
-        {"label": "Amine",         "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok"]},
-        {"label": "Alkyl halide",  "accepts": ["alkyl_halide"], "sets": []}
+        {"label": "Primary/secondary amine", "accepts": ["primary_amine", "secondary_amine"], "sets": ["primary_amines_100", "primary_amines_500", "primary_amines_ok", "secondary_amines_100", "secondary_amines_500", "secondary_amines_ok"]},
+        {"label": "Alkyl halide",             "accepts": ["alkyl_halide"], "sets": []}
       ]
     },
     {
